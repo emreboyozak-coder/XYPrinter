@@ -305,6 +305,9 @@ class PCBPrinterGUI(QMainWindow):
         self.add_zone_2_sample_button.clicked.connect(lambda: self.start_teaching_zone(1, append=True))
         camera_connection.addWidget(self.add_zone_2_sample_button, 3, 2, 1, 2)
         camera_group_layout.addLayout(camera_connection)
+        self.sample_library_label = QLabel("Sample library: Zone 1 = 0, Zone 2 = 0. Add as many samples as needed.")
+        self.sample_library_label.setWordWrap(True)
+        camera_group_layout.addWidget(self.sample_library_label)
         self.alignment_label = QLabel("Teach both 11 x 5 mm print targets; matching context is captured automatically.")
         self.alignment_label.setWordWrap(True)
         camera_group_layout.addWidget(self.alignment_label)
@@ -467,6 +470,7 @@ class PCBPrinterGUI(QMainWindow):
         self.camera_thread.start()
         if self.camera_thread.loaded_saved_zones:
             self.alignment_label.setText("Saved print zones loaded. Confirm the red and green rectangles match the board.")
+        self.update_sample_library_label()
 
     def disconnect_camera(self) -> None:
         if self.camera_thread:
@@ -515,6 +519,7 @@ class PCBPrinterGUI(QMainWindow):
             self.camera_thread.teach_zone(index, Rectangle(x, y, width, height), append)
             count_1, count_2 = self.camera_thread.aligner.sample_counts()
             self.status_label.setText(f"Zone {index + 1} saved. Samples: Zone 1 = {count_1}, Zone 2 = {count_2}.")
+            self.update_sample_library_label()
         except Exception as exc:
             self.status_label.setText(f"Could not teach zone: {exc}")
         finally:
@@ -527,7 +532,17 @@ class PCBPrinterGUI(QMainWindow):
         self.pixels_per_mm_x = None
         self.x_calibration_label.setText("X calibration: required")
         self.alignment_label.setText("Teach both 11 x 5 mm print targets; matching context is captured automatically.")
+        self.update_sample_library_label()
         self._update_motion_ui()
+
+    def update_sample_library_label(self) -> None:
+        if not self.camera_thread:
+            self.sample_library_label.setText("Sample library: camera is disconnected.")
+            return
+        count_1, count_2 = self.camera_thread.aligner.sample_counts()
+        self.sample_library_label.setText(
+            f"Sample library: Zone 1 = {count_1}, Zone 2 = {count_2}. Add as many samples as needed."
+        )
 
     def on_alignment_status(self, session: int, message: str) -> None:
         if session != self._camera_session:

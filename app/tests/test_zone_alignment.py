@@ -71,3 +71,20 @@ def test_multiple_samples_are_saved_for_each_zone(tmp_path) -> None:
     loaded = PrintZoneAligner()
     assert loaded.load(path) is True
     assert loaded.sample_counts() == (2, 2)
+
+
+def test_sample_library_accepts_many_examples(tmp_path) -> None:
+    reference = _reference_frame()
+    path = tmp_path / "print-zone-templates.npz"
+    aligner = PrintZoneAligner()
+    aligner.teach(0, reference, Rectangle(80, 100, 66, 51))
+    aligner.teach(1, reference, Rectangle(240, 105, 66, 51))
+    for _ in range(20):
+        aligner.teach(0, reference, Rectangle(80, 100, 66, 51), append=True)
+        aligner.teach(1, reference, Rectangle(240, 105, 66, 51), append=True)
+
+    assert aligner.sample_counts() == (21, 21)
+    aligner.save(path)
+    reloaded = PrintZoneAligner()
+    assert reloaded.load(path) is True
+    assert reloaded.sample_counts() == (21, 21)
