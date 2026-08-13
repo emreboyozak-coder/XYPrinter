@@ -31,15 +31,25 @@ class AlignmentMeasurement:
     score_2: float
 
 
+@dataclass(frozen=True)
+class LearnedZone:
+    """A print target plus the larger visual context used to locate it."""
+
+    guide: Rectangle
+    template: np.ndarray
+    target_offset_x: int
+    target_offset_y: int
+
+
 class PrintZoneAligner:
     """Learns two visual templates and compares them to fixed screen guides."""
 
     _MIN_SCORE = 0.70
+    _CONTEXT_PADDING_PX = 40
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._templates: list[np.ndarray | None] = [None, None]
-        self._guides: list[Rectangle | None] = [None, None]
+        self._zones: list[LearnedZone | None] = [None, None]
 
     def teach(self, index: int, frame: np.ndarray, rectangle: Rectangle) -> None:
         if index not in (0, 1):
@@ -51,42 +61,57 @@ class PrintZoneAligner:
         if rectangle.x < 0 or rectangle.y < 0 or rectangle.x + rectangle.width > width or rectangle.y + rectangle.height > height:
             raise ValueError("Selected zone is outside the camera frame")
 
-        template = cv2.cvtColor(
-            frame[rectangle.y : rectangle.y + rectangle.height, rectangle.x : rectangle.x + rectangle.width],
-            cv2.COLOR_BGR2GRAY,
-        ).copy()
+        left = max(0, rectangle.x - self._CONTEXT_PADDING_PX)
+        top = max(0, rectangle.y - self._CONTEXT_PADDING_PX)
+        right = min(width, rectangle.x + rectangle.width + self._CONTEXT_PADDING_PX)
+        bottom = min(height, rectangle.y + rectangle.height + self._CONTEXT_PADDING_PX)
+        template = self._normalize(frame[top:bottom, left:right])
+        zone = LearnedZone(
+            guide=rectangle,
+            template=template,
+            target_offset_x=rectangle.x - left,
+            target_offset_y=rectangle.y - top,
+        )
         with self._lock:
-            self._templates[index] = template
-            self._guides[index] = rectangle
+            self._zones[index] = zone
 
     def clear(self) -> None:
         with self._lock:
-            self._templates = [None, None]
-            self._guides = [None, None]
+            self._zones = [None, None]
+
+    @staticmethod
+    def _normalize(frame: np.ndarray) -> np.ndarray:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        return cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
 
     def process(self, frame: np.ndarray) -> tuple[np.ndarray, AlignmentMeasurement | None, str]:
         with self._lock:
-            templates = list(self._templates)
-            guides = list(self._guides)
+            zones = list(self._zones)
 
         annotated = frame.copy()
-        if any(template is None for template in templates):
+        if any(zone is None for zone in zones):
             cv2.putText(annotated, "Teach Zone 1 and Zone 2", (12, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-            return annotated, None, "Teach both print zones by dragging red rectangles over them."
+            return annotated, None, "Teach both 11 x 5 mm print targets; surrounding visual context is captured automatically."
 
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = self._normalize(frame)
         matches: list[tuple[Rectangle, float]] = []
-        for template, guide in zip(templates, guides):
-            assert template is not None
-            assert guide is not None
-            result = cv2.matchTemplate(gray, template, cv2.TM_CCOEFF_NORMED)
+        guides: list[Rectangle] = []
+        for zone in zones:
+            assert zone is not None
+            result = cv2.matchTemplate(gray, zone.template, cv2.TM_CCOEFF_NORMED)
             _, score, _, location = cv2.minMaxLoc(result)
-            match = Rectangle(location[0], location[1], template.shape[1], template.shape[0])
+            match = Rectangle(
+                location[0] + zone.target_offset_x,
+                location[1] + zone.target_offset_y,
+                zone.guide.width,
+                zone.guide.height,
+            )
             matches.append((match, float(score)))
+            guides.append(zone.guide)
             cv2.rectangle(
                 annotated,
-                (guide.x, guide.y),
-                (guide.x + guide.width, guide.y + guide.height),
+                (zone.guide.x, zone.guide.y),
+                (zone.guide.x + zone.guide.width, zone.guide.y + zone.guide.height),
                 (0, 0, 255),
                 2,
             )
@@ -104,8 +129,8 @@ class PrintZoneAligner:
 
         detected_x = sum(match.center[0] for match, _ in matches) / 2.0
         detected_y = sum(match.center[1] for match, _ in matches) / 2.0
-        guide_x = sum(guide.center[0] for guide in guides if guide is not None) / 2.0
-        guide_y = sum(guide.center[1] for guide in guides if guide is not None) / 2.0
+        guide_x = sum(guide.center[0] for guide in guides) / 2.0
+        guide_y = sum(guide.center[1] for guide in guides) / 2.0
         measurement = AlignmentMeasurement(
             midpoint_x=detected_x,
             midpoint_y=detected_y,

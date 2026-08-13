@@ -283,7 +283,7 @@ class PCBPrinterGUI(QMainWindow):
         self.clear_zones_button.clicked.connect(self.clear_zones)
         camera_connection.addWidget(self.clear_zones_button, 2, 2, 1, 2)
         camera_group_layout.addLayout(camera_connection)
-        self.alignment_label = QLabel("Teach both print zones to begin alignment.")
+        self.alignment_label = QLabel("Teach both 11 x 5 mm print targets; matching context is captured automatically.")
         self.alignment_label.setWordWrap(True)
         camera_group_layout.addWidget(self.alignment_label)
         camera_layout.addWidget(camera_group)
@@ -462,7 +462,7 @@ class PCBPrinterGUI(QMainWindow):
             return
         self._teach_zone_index = index
         self.camera_label.set_selection_enabled(True)
-        self.status_label.setText(f"Drag a rectangle tightly around print zone {index + 1} in the live image.")
+        self.status_label.setText(f"Drag the red target rectangle around 11 x 5 mm print zone {index + 1}; context is added automatically.")
 
     def on_zone_selected(self, x: int, y: int, width: int, height: int) -> None:
         if self._teach_zone_index is None or not self.camera_thread:
@@ -481,7 +481,7 @@ class PCBPrinterGUI(QMainWindow):
         self.last_measurement = None
         self.pixels_per_mm_x = None
         self.x_calibration_label.setText("X calibration: required")
-        self.alignment_label.setText("Teach both print zones to begin alignment.")
+        self.alignment_label.setText("Teach both 11 x 5 mm print targets; matching context is captured automatically.")
         self._update_motion_ui()
 
     def on_alignment_status(self, message: str) -> None:

@@ -26,3 +26,17 @@ def test_zone_alignment_reports_translation_error() -> None:
     assert measurement is not None, status
     assert abs(measurement.error_x + 12) < 2
     assert abs(measurement.error_y - 7) < 2
+
+
+def test_context_keeps_a_plain_print_zone_distinct() -> None:
+    reference = _reference_frame()
+    aligner = PrintZoneAligner()
+    aligner.teach(0, reference, Rectangle(80, 100, 66, 51))
+    aligner.teach(1, reference, Rectangle(240, 105, 66, 51))
+
+    brighter = cv2.convertScaleAbs(reference, alpha=1.15, beta=12)
+    _, measurement, status = aligner.process(brighter)
+
+    assert measurement is not None, status
+    assert measurement.score_1 >= 0.70
+    assert measurement.score_2 >= 0.70
