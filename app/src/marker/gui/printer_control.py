@@ -107,18 +107,14 @@ class CameraPreview(QLabel):
 
     def paintEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         super().paintEvent(event)
-        if self._frame_size.isEmpty():
+        if not self._drag_start or not self._drag_end or self._frame_size.isEmpty():
             return
         visible = self._visible_rect()
-        painter = QPainter(self)
-        painter.setPen(QPen(Qt.cyan, 2))
-        painter.drawLine(visible.center().x(), visible.top(), visible.center().x(), visible.bottom())
-        if not self._drag_start or not self._drag_end:
-            return
         scale_x = visible.width() / self._frame_size.width()
         scale_y = visible.height() / self._frame_size.height()
         start = QPoint(visible.x() + round(self._drag_start.x() * scale_x), visible.y() + round(self._drag_start.y() * scale_y))
         end = QPoint(visible.x() + round(self._drag_end.x() * scale_x), visible.y() + round(self._drag_end.y() * scale_y))
+        painter = QPainter(self)
         painter.setPen(QPen(Qt.red, 2))
         painter.drawRect(QRect(start, end).normalized())
 
@@ -153,7 +149,7 @@ class CameraThread(QThread):
 
     frame_ready = pyqtSignal(int, QImage)
     connection_changed = pyqtSignal(int, bool, str)
-    alignment_measurement_changed = pyqtSignal(int, int, float, float, float, float, float, float)
+    alignment_measurement_changed = pyqtSignal(int, float, float, float, float, float, float)
     alignment_status_changed = pyqtSignal(int, str)
 
     def __init__(self, session: int, ip: str, port: int, template_path: Path) -> None:
@@ -213,7 +209,6 @@ class CameraThread(QThread):
             if measurement:
                 self.alignment_measurement_changed.emit(
                     self.session,
-                    frame.shape[1],
                     measurement.midpoint_x,
                     measurement.midpoint_y,
                     measurement.error_x,
@@ -254,7 +249,6 @@ class PCBPrinterGUI(QMainWindow):
         self.current_x = 0.0
         self.current_y = 0.0
         self.last_measurement: Optional[AlignmentMeasurement] = None
-        self.camera_frame_width = 0
         self.pixels_per_mm_x: Optional[float] = None
         self._teach_zone_request: Optional[tuple[int, bool]] = None
         self._pending_calibration: Optional[tuple[float, float]] = None
@@ -325,13 +319,13 @@ class PCBPrinterGUI(QMainWindow):
         controls.addWidget(self._build_position_group())
         controls.addWidget(self._build_move_group())
 
-        alignment_group = QGroupBox("X Centering")
+        alignment_group = QGroupBox("X Alignment")
         alignment_layout = QVBoxLayout(alignment_group)
         self.calibrate_x_button = QPushButton("Calibrate X (+10 mm)")
         self.calibrate_x_button.clicked.connect(self.calibrate_x)
         self.calibrate_x_button.setEnabled(False)
         alignment_layout.addWidget(self.calibrate_x_button)
-        self.align_x_button = QPushButton("Center X on Vertical Line (max 2 mm)")
+        self.align_x_button = QPushButton("Align X (max 2 mm)")
         self.align_x_button.clicked.connect(self.align_x)
         self.align_x_button.setEnabled(False)
         alignment_layout.addWidget(self.align_x_button)
@@ -555,14 +549,12 @@ class PCBPrinterGUI(QMainWindow):
             return
         self.alignment_label.setText(message)
 
-    def on_alignment_measurement(self, session: int, frame_width: int, midpoint_x: float, midpoint_y: float, error_x: float, error_y: float, score_1: float, score_2: float) -> None:
+    def on_alignment_measurement(self, session: int, midpoint_x: float, midpoint_y: float, error_x: float, error_y: float, score_1: float, score_2: float) -> None:
         if session != self._camera_session:
             return
-        self.camera_frame_width = frame_width
         self.last_measurement = AlignmentMeasurement(midpoint_x, midpoint_y, error_x, error_y, score_1, score_2)
-        center_error_x = (frame_width / 2.0) - midpoint_x
         self.alignment_label.setText(
-            f"Detected. Center-line X error: {center_error_x:+.1f} px. "
+            f"Detected. X error: {error_x:+.1f} px, Y error: {error_y:+.1f} px. "
             f"Scores: {score_1:.2f}, {score_2:.2f}."
         )
         self._update_motion_ui()
@@ -620,15 +612,14 @@ class PCBPrinterGUI(QMainWindow):
         self._update_motion_ui()
 
     def align_x(self) -> None:
-        if not self.last_measurement or not self.pixels_per_mm_x or not self.camera_frame_width:
+        if not self.last_measurement or not self.pixels_per_mm_x:
             return
-        center_error_px = (self.camera_frame_width / 2.0) - self.last_measurement.midpoint_x
-        correction_mm = center_error_px / self.pixels_per_mm_x
+        correction_mm = self.last_measurement.error_x / self.pixels_per_mm_x
         if abs(correction_mm) < 0.05:
-            self.status_label.setText("Print zones are already centered on the vertical line within 0.05 mm.")
+            self.status_label.setText("X is already aligned within 0.05 mm.")
             return
         correction_mm = max(-self.MAX_AUTO_X_STEP_MM, min(self.MAX_AUTO_X_STEP_MM, correction_mm))
-        self._start_move(self.current_x + correction_mm, self.current_y, "Centering X")
+        self._start_move(self.current_x + correction_mm, self.current_y, "Aligning X")
 
     def _set_position_labels(self) -> None:
         self.x_position_label.setText(f"{self.current_x:.3f} mm")
