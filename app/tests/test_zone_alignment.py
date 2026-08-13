@@ -40,3 +40,17 @@ def test_context_keeps_a_plain_print_zone_distinct() -> None:
     assert measurement is not None, status
     assert measurement.score_1 >= 0.70
     assert measurement.score_2 >= 0.70
+
+
+def test_taught_zones_persist_between_application_starts(tmp_path) -> None:
+    reference = _reference_frame()
+    path = tmp_path / "print-zone-templates.npz"
+    aligner = PrintZoneAligner()
+    aligner.teach(0, reference, Rectangle(80, 100, 66, 51))
+    aligner.teach(1, reference, Rectangle(240, 105, 66, 51))
+    aligner.save(path)
+
+    loaded = PrintZoneAligner()
+    assert loaded.load(path) is True
+    _, measurement, status = loaded.process(reference)
+    assert measurement is not None, status

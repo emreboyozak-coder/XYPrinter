@@ -28,4 +28,5 @@ camera_live_frame.jpg
 
 # Local config
 config/*.yaml
+config/print-zone-templates.npz
 !config/*.example.yaml

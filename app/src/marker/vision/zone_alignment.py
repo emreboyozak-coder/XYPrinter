@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -44,8 +45,9 @@ class LearnedZone:
 class PrintZoneAligner:
     """Learns two visual templates and compares them to fixed screen guides."""
 
-    _MIN_SCORE = 0.70
+    _MIN_SCORE = 0.52
     _CONTEXT_PADDING_PX = 40
+    _MAX_PAIR_SHIFT_DIFFERENCE_PX = 16.0
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -79,6 +81,47 @@ class PrintZoneAligner:
         with self._lock:
             self._zones = [None, None]
 
+    def save(self, path: Path) -> None:
+        """Persist taught targets for a fixed camera and fixture."""
+        with self._lock:
+            if any(zone is None for zone in self._zones):
+                return
+            zones = [zone for zone in self._zones if zone is not None]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            path,
+            template_0=zones[0].template,
+            template_1=zones[1].template,
+            guide_0=np.array([zones[0].guide.x, zones[0].guide.y, zones[0].guide.width, zones[0].guide.height]),
+            guide_1=np.array([zones[1].guide.x, zones[1].guide.y, zones[1].guide.width, zones[1].guide.height]),
+            offset_0=np.array([zones[0].target_offset_x, zones[0].target_offset_y]),
+            offset_1=np.array([zones[1].target_offset_x, zones[1].target_offset_y]),
+        )
+
+    def load(self, path: Path) -> bool:
+        """Load previously taught targets, returning False if none are available."""
+        if not path.exists():
+            return False
+        try:
+            with np.load(path, allow_pickle=False) as data:
+                zones = []
+                for index in (0, 1):
+                    guide_values = [int(value) for value in data[f"guide_{index}"]]
+                    offset_values = [int(value) for value in data[f"offset_{index}"]]
+                    zones.append(
+                        LearnedZone(
+                            guide=Rectangle(*guide_values),
+                            template=data[f"template_{index}"].copy(),
+                            target_offset_x=offset_values[0],
+                            target_offset_y=offset_values[1],
+                        )
+                    )
+        except (KeyError, OSError, ValueError):
+            return False
+        with self._lock:
+            self._zones = zones
+        return True
+
     @staticmethod
     def _normalize(frame: np.ndarray) -> np.ndarray:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -94,20 +137,20 @@ class PrintZoneAligner:
             return annotated, None, "Teach both 11 x 5 mm print targets; surrounding visual context is captured automatically."
 
         gray = self._normalize(frame)
-        matches: list[tuple[Rectangle, float]] = []
+        candidate_sets: list[list[tuple[Rectangle, float]]] = []
         guides: list[Rectangle] = []
         for zone in zones:
             assert zone is not None
             result = cv2.matchTemplate(gray, zone.template, cv2.TM_CCOEFF_NORMED)
-            _, score, _, location = cv2.minMaxLoc(result)
-            match = Rectangle(
-                location[0] + zone.target_offset_x,
-                location[1] + zone.target_offset_y,
-                zone.guide.width,
-                zone.guide.height,
-            )
-            matches.append((match, float(score)))
+            candidate_sets.append(self._top_candidates(result, zone))
             guides.append(zone.guide)
+
+        matches = self._select_consistent_pair(candidate_sets[0], candidate_sets[1], guides)
+        if matches is None:
+            return annotated, None, "Print-zone matches disagree. Keep the camera fixed or reteach the zones."
+
+        for (match, score), zone in zip(matches, zones):
+            assert zone is not None
             cv2.rectangle(
                 annotated,
                 (zone.guide.x, zone.guide.y),
@@ -149,3 +192,48 @@ class PrintZoneAligner:
             2,
         )
         return annotated, measurement, "Print zones detected"
+
+    @staticmethod
+    def _top_candidates(result: np.ndarray, zone: LearnedZone, count: int = 8) -> list[tuple[Rectangle, float]]:
+        """Return spatially distinct likely matches rather than only one peak."""
+        working = result.copy()
+        candidates: list[tuple[Rectangle, float]] = []
+        suppression = max(12, min(zone.template.shape) // 2)
+        for _ in range(count):
+            _, score, _, location = cv2.minMaxLoc(working)
+            if score < PrintZoneAligner._MIN_SCORE:
+                break
+            match = Rectangle(
+                location[0] + zone.target_offset_x,
+                location[1] + zone.target_offset_y,
+                zone.guide.width,
+                zone.guide.height,
+            )
+            candidates.append((match, float(score)))
+            cv2.rectangle(
+                working,
+                (max(0, location[0] - suppression), max(0, location[1] - suppression)),
+                (min(working.shape[1] - 1, location[0] + suppression), min(working.shape[0] - 1, location[1] + suppression)),
+                -1.0,
+                -1,
+            )
+        return candidates
+
+    def _select_consistent_pair(
+        self,
+        first: list[tuple[Rectangle, float]],
+        second: list[tuple[Rectangle, float]],
+        guides: list[Rectangle],
+    ) -> list[tuple[Rectangle, float]] | None:
+        best: tuple[float, list[tuple[Rectangle, float]]] | None = None
+        for match_1, score_1 in first:
+            shift_1 = (match_1.x - guides[0].x, match_1.y - guides[0].y)
+            for match_2, score_2 in second:
+                shift_2 = (match_2.x - guides[1].x, match_2.y - guides[1].y)
+                disagreement = float(np.hypot(shift_1[0] - shift_2[0], shift_1[1] - shift_2[1]))
+                if disagreement > self._MAX_PAIR_SHIFT_DIFFERENCE_PX:
+                    continue
+                quality = score_1 + score_2 - (disagreement / self._MAX_PAIR_SHIFT_DIFFERENCE_PX)
+                if best is None or quality > best[0]:
+                    best = (quality, [(match_1, score_1), (match_2, score_2)])
+        return best[1] if best else None

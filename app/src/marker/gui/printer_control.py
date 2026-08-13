@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import sys
 import threading
+from pathlib import Path
 from typing import Optional
 
 import cv2
@@ -151,14 +152,16 @@ class CameraThread(QThread):
     alignment_measurement_changed = pyqtSignal(int, float, float, float, float, float, float)
     alignment_status_changed = pyqtSignal(int, str)
 
-    def __init__(self, session: int, ip: str, port: int) -> None:
+    def __init__(self, session: int, ip: str, port: int, template_path: Path) -> None:
         super().__init__()
         self.session = session
         self.url = f"http://{ip}:{port}/video"
+        self.template_path = template_path
         self._running = True
         self._frame_lock = threading.Lock()
         self._latest_frame: Optional[object] = None
         self.aligner = PrintZoneAligner()
+        self.loaded_saved_zones = self.aligner.load(template_path)
         self._last_status = ""
 
     def stop(self) -> None:
@@ -170,9 +173,11 @@ class CameraThread(QThread):
                 raise RuntimeError("No camera frame is available")
             frame = self._latest_frame.copy()
         self.aligner.teach(index, frame, rectangle)
+        self.aligner.save(self.template_path)
 
     def clear_zones(self) -> None:
         self.aligner.clear()
+        self.template_path.unlink(missing_ok=True)
 
     def _emit_status(self, status: str) -> None:
         if status != self._last_status:
@@ -228,6 +233,7 @@ class PCBPrinterGUI(QMainWindow):
 
     CALIBRATION_DISTANCE_MM = 10.0
     MAX_AUTO_X_STEP_MM = 2.0
+    TEMPLATE_PATH = Path(__file__).resolve().parents[4] / "config" / "print-zone-templates.npz"
 
     def __init__(self) -> None:
         super().__init__()
@@ -442,7 +448,10 @@ class PCBPrinterGUI(QMainWindow):
         self.camera_label.setText("Connecting to DroidCam...")
         self.camera_connect_button.setEnabled(False)
         self.camera_thread = CameraThread(
-            self._camera_session, self.camera_ip_input.text().strip(), self.camera_port_input.value()
+            self._camera_session,
+            self.camera_ip_input.text().strip(),
+            self.camera_port_input.value(),
+            self.TEMPLATE_PATH,
         )
         self.camera_thread.frame_ready.connect(self.show_camera_frame)
         self.camera_thread.connection_changed.connect(self.on_camera_connection_changed)
@@ -450,6 +459,8 @@ class PCBPrinterGUI(QMainWindow):
         self.camera_thread.alignment_status_changed.connect(self.on_alignment_status)
         self.camera_thread.finished.connect(lambda thread=self.camera_thread: self.on_camera_thread_finished(thread))
         self.camera_thread.start()
+        if self.camera_thread.loaded_saved_zones:
+            self.alignment_label.setText("Saved print zones loaded. Confirm the red and green rectangles match the board.")
 
     def disconnect_camera(self) -> None:
         if self.camera_thread:
