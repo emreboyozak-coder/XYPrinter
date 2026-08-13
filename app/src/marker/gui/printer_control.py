@@ -146,13 +146,14 @@ class MotionThread(QThread):
 class CameraThread(QThread):
     """Reads DroidCam and applies two-zone template alignment off the GUI thread."""
 
-    frame_ready = pyqtSignal(QImage)
-    connection_changed = pyqtSignal(bool, str)
-    alignment_measurement_changed = pyqtSignal(float, float, float, float, float, float)
-    alignment_status_changed = pyqtSignal(str)
+    frame_ready = pyqtSignal(int, QImage)
+    connection_changed = pyqtSignal(int, bool, str)
+    alignment_measurement_changed = pyqtSignal(int, float, float, float, float, float, float)
+    alignment_status_changed = pyqtSignal(int, str)
 
-    def __init__(self, ip: str, port: int) -> None:
+    def __init__(self, session: int, ip: str, port: int) -> None:
         super().__init__()
+        self.session = session
         self.url = f"http://{ip}:{port}/video"
         self._running = True
         self._frame_lock = threading.Lock()
@@ -162,7 +163,6 @@ class CameraThread(QThread):
 
     def stop(self) -> None:
         self._running = False
-        self.wait(2000)
 
     def teach_zone(self, index: int, rectangle: Rectangle) -> None:
         with self._frame_lock:
@@ -177,17 +177,24 @@ class CameraThread(QThread):
     def _emit_status(self, status: str) -> None:
         if status != self._last_status:
             self._last_status = status
-            self.alignment_status_changed.emit(status)
+            self.alignment_status_changed.emit(self.session, status)
 
     def run(self) -> None:
-        camera = cv2.VideoCapture(self.url)
+        camera = cv2.VideoCapture()
+        camera.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 3000)
+        camera.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 3000)
+        opened = camera.open(self.url, cv2.CAP_FFMPEG)
+        if not opened:
+            camera.release()
+            self.connection_changed.emit(self.session, False, f"Camera connection failed: {self.url}")
+            return
         ok, frame = camera.read()
         if not ok or frame is None:
             camera.release()
-            self.connection_changed.emit(False, "Camera connection failed")
+            self.connection_changed.emit(self.session, False, f"Camera stream did not return a frame: {self.url}")
             return
 
-        self.connection_changed.emit(True, f"Camera connected: {self.url}")
+        self.connection_changed.emit(self.session, True, f"Camera connected: {self.url}")
         while self._running:
             with self._frame_lock:
                 self._latest_frame = frame.copy()
@@ -196,6 +203,7 @@ class CameraThread(QThread):
             self._emit_status(status)
             if measurement:
                 self.alignment_measurement_changed.emit(
+                    self.session,
                     measurement.midpoint_x,
                     measurement.midpoint_y,
                     measurement.error_x,
@@ -206,7 +214,7 @@ class CameraThread(QThread):
 
             rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
             height, width, channels = rgb.shape
-            self.frame_ready.emit(QImage(rgb.data, width, height, channels * width, QImage.Format_RGB888).copy())
+            self.frame_ready.emit(self.session, QImage(rgb.data, width, height, channels * width, QImage.Format_RGB888).copy())
             ok, frame = camera.read()
             if not ok or frame is None:
                 self._emit_status("Camera stream interrupted")
@@ -229,6 +237,8 @@ class PCBPrinterGUI(QMainWindow):
         self.motion: Optional[MotionController] = None
         self.motion_thread: Optional[MotionThread] = None
         self.camera_thread: Optional[CameraThread] = None
+        self._retired_camera_threads: list[CameraThread] = []
+        self._camera_session = 0
         self.is_connected = False
         self.current_x = 0.0
         self.current_y = 0.0
@@ -428,26 +438,41 @@ class PCBPrinterGUI(QMainWindow):
 
     def connect_camera(self) -> None:
         self.disconnect_camera()
+        self._camera_session += 1
         self.camera_label.setText("Connecting to DroidCam...")
         self.camera_connect_button.setEnabled(False)
-        self.camera_thread = CameraThread(self.camera_ip_input.text().strip(), self.camera_port_input.value())
+        self.camera_thread = CameraThread(
+            self._camera_session, self.camera_ip_input.text().strip(), self.camera_port_input.value()
+        )
         self.camera_thread.frame_ready.connect(self.show_camera_frame)
         self.camera_thread.connection_changed.connect(self.on_camera_connection_changed)
         self.camera_thread.alignment_measurement_changed.connect(self.on_alignment_measurement)
         self.camera_thread.alignment_status_changed.connect(self.on_alignment_status)
+        self.camera_thread.finished.connect(lambda thread=self.camera_thread: self.on_camera_thread_finished(thread))
         self.camera_thread.start()
 
     def disconnect_camera(self) -> None:
         if self.camera_thread:
             self.camera_thread.stop()
+            self._retired_camera_threads.append(self.camera_thread)
             self.camera_thread = None
+        self._camera_session += 1
         self.camera_disconnect_button.setEnabled(False)
         self.camera_connect_button.setEnabled(True)
 
-    def show_camera_frame(self, image: QImage) -> None:
+    def on_camera_thread_finished(self, thread: CameraThread) -> None:
+        if thread in self._retired_camera_threads:
+            self._retired_camera_threads.remove(thread)
+        thread.deleteLater()
+
+    def show_camera_frame(self, session: int, image: QImage) -> None:
+        if session != self._camera_session:
+            return
         self.camera_label.show_image(image)
 
-    def on_camera_connection_changed(self, connected: bool, message: str) -> None:
+    def on_camera_connection_changed(self, session: int, connected: bool, message: str) -> None:
+        if session != self._camera_session:
+            return
         self.camera_connect_button.setEnabled(not connected)
         self.camera_disconnect_button.setEnabled(connected)
         self.camera_ip_input.setEnabled(not connected)
@@ -484,10 +509,14 @@ class PCBPrinterGUI(QMainWindow):
         self.alignment_label.setText("Teach both 11 x 5 mm print targets; matching context is captured automatically.")
         self._update_motion_ui()
 
-    def on_alignment_status(self, message: str) -> None:
+    def on_alignment_status(self, session: int, message: str) -> None:
+        if session != self._camera_session:
+            return
         self.alignment_label.setText(message)
 
-    def on_alignment_measurement(self, midpoint_x: float, midpoint_y: float, error_x: float, error_y: float, score_1: float, score_2: float) -> None:
+    def on_alignment_measurement(self, session: int, midpoint_x: float, midpoint_y: float, error_x: float, error_y: float, score_1: float, score_2: float) -> None:
+        if session != self._camera_session:
+            return
         self.last_measurement = AlignmentMeasurement(midpoint_x, midpoint_y, error_x, error_y, score_1, score_2)
         self.alignment_label.setText(
             f"Detected. X error: {error_x:+.1f} px, Y error: {error_y:+.1f} px. "
