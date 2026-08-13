@@ -167,12 +167,12 @@ class CameraThread(QThread):
     def stop(self) -> None:
         self._running = False
 
-    def teach_zone(self, index: int, rectangle: Rectangle) -> None:
+    def teach_zone(self, index: int, rectangle: Rectangle, append: bool) -> None:
         with self._frame_lock:
             if self._latest_frame is None:
                 raise RuntimeError("No camera frame is available")
             frame = self._latest_frame.copy()
-        self.aligner.teach(index, frame, rectangle)
+        self.aligner.teach(index, frame, rectangle, append=append)
         self.aligner.save(self.template_path)
 
     def clear_zones(self) -> None:
@@ -250,7 +250,7 @@ class PCBPrinterGUI(QMainWindow):
         self.current_y = 0.0
         self.last_measurement: Optional[AlignmentMeasurement] = None
         self.pixels_per_mm_x: Optional[float] = None
-        self._teach_zone_index: Optional[int] = None
+        self._teach_zone_request: Optional[tuple[int, bool]] = None
         self._pending_calibration: Optional[tuple[float, float]] = None
 
         self._build_ui()
@@ -298,6 +298,12 @@ class PCBPrinterGUI(QMainWindow):
         self.clear_zones_button = QPushButton("Clear Zones")
         self.clear_zones_button.clicked.connect(self.clear_zones)
         camera_connection.addWidget(self.clear_zones_button, 2, 2, 1, 2)
+        self.add_zone_1_sample_button = QPushButton("Add Zone 1 Sample")
+        self.add_zone_1_sample_button.clicked.connect(lambda: self.start_teaching_zone(0, append=True))
+        camera_connection.addWidget(self.add_zone_1_sample_button, 3, 0, 1, 2)
+        self.add_zone_2_sample_button = QPushButton("Add Zone 2 Sample")
+        self.add_zone_2_sample_button.clicked.connect(lambda: self.start_teaching_zone(1, append=True))
+        camera_connection.addWidget(self.add_zone_2_sample_button, 3, 2, 1, 2)
         camera_group_layout.addLayout(camera_connection)
         self.alignment_label = QLabel("Teach both 11 x 5 mm print targets; matching context is captured automatically.")
         self.alignment_label.setWordWrap(True)
@@ -492,24 +498,27 @@ class PCBPrinterGUI(QMainWindow):
             self.camera_label.setText(message)
         self.status_label.setText(message)
 
-    def start_teaching_zone(self, index: int) -> None:
+    def start_teaching_zone(self, index: int, append: bool = False) -> None:
         if not self.camera_thread or not self.camera_thread.isRunning():
             self.status_label.setText("Connect the camera before teaching a print zone.")
             return
-        self._teach_zone_index = index
+        self._teach_zone_request = (index, append)
         self.camera_label.set_selection_enabled(True)
-        self.status_label.setText(f"Drag the red target rectangle around 11 x 5 mm print zone {index + 1}; context is added automatically.")
+        action = "Add a new example for" if append else "Set the red target for"
+        self.status_label.setText(f"{action} 11 x 5 mm print zone {index + 1}; context is added automatically.")
 
     def on_zone_selected(self, x: int, y: int, width: int, height: int) -> None:
-        if self._teach_zone_index is None or not self.camera_thread:
+        if self._teach_zone_request is None or not self.camera_thread:
             return
+        index, append = self._teach_zone_request
         try:
-            self.camera_thread.teach_zone(self._teach_zone_index, Rectangle(x, y, width, height))
-            self.status_label.setText(f"Zone {self._teach_zone_index + 1} taught. Teach the other zone next.")
+            self.camera_thread.teach_zone(index, Rectangle(x, y, width, height), append)
+            count_1, count_2 = self.camera_thread.aligner.sample_counts()
+            self.status_label.setText(f"Zone {index + 1} saved. Samples: Zone 1 = {count_1}, Zone 2 = {count_2}.")
         except Exception as exc:
             self.status_label.setText(f"Could not teach zone: {exc}")
         finally:
-            self._teach_zone_index = None
+            self._teach_zone_request = None
 
     def clear_zones(self) -> None:
         if self.camera_thread:

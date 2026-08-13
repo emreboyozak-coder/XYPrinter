@@ -54,3 +54,20 @@ def test_taught_zones_persist_between_application_starts(tmp_path) -> None:
     assert loaded.load(path) is True
     _, measurement, status = loaded.process(reference)
     assert measurement is not None, status
+
+
+def test_multiple_samples_are_saved_for_each_zone(tmp_path) -> None:
+    reference = _reference_frame()
+    shifted = cv2.warpAffine(reference, np.float32([[1, 0, 9], [0, 1, 4]]), (400, 240), borderValue=(220, 220, 220))
+    path = tmp_path / "print-zone-templates.npz"
+    aligner = PrintZoneAligner()
+    aligner.teach(0, reference, Rectangle(80, 100, 66, 51))
+    aligner.teach(1, reference, Rectangle(240, 105, 66, 51))
+    aligner.teach(0, shifted, Rectangle(89, 104, 66, 51), append=True)
+    aligner.teach(1, shifted, Rectangle(249, 109, 66, 51), append=True)
+    assert aligner.sample_counts() == (2, 2)
+    aligner.save(path)
+
+    loaded = PrintZoneAligner()
+    assert loaded.load(path) is True
+    assert loaded.sample_counts() == (2, 2)
