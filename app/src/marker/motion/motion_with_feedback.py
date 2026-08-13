@@ -24,7 +24,7 @@ class MotionWithFeedback:
     def __init__(
         self,
         motion: MotionController,
-        camera_ip: str = "10.59.59.49",
+        camera_ip: str = "10.59.59.87",
         camera_port: int = 4747,
         auto_connect_camera: bool = True
     ):

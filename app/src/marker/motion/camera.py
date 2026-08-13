@@ -19,7 +19,7 @@ class CameraFeed:
         Initialize camera connection.
         
         Args:
-            ip: WiFi IP address shown by DroidCam (e.g., '10.59.59.49')
+            ip: WiFi IP address shown by DroidCam (e.g., '10.59.59.87')
             port: DroidCam port (default 4747)
         """
         self.ip = ip
@@ -157,7 +157,7 @@ def main():
     import sys
     
     # Default DroidCam settings
-    ip = "10.59.59.49"
+    ip = "10.59.59.87"
     port = 4747
     
     if len(sys.argv) > 1:

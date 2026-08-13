@@ -60,7 +60,7 @@ def test_serial_connection(port: str = "COM6") -> bool:
         return False
 
 
-def test_camera_connection(camera_ip: str = "10.59.59.49") -> bool:
+def test_camera_connection(camera_ip: str = "10.59.59.87") -> bool:
     """Test camera connection."""
     print("\n" + "="*60)
     print("TEST 2: Camera Connection")
@@ -92,7 +92,7 @@ def test_camera_connection(camera_ip: str = "10.59.59.49") -> bool:
         return False
 
 
-def test_motion_with_feedback(port: str = "COM6", camera_ip: str = "10.59.59.49") -> bool:
+def test_motion_with_feedback(port: str = "COM6", camera_ip: str = "10.59.59.87") -> bool:
     """Test integrated motion with camera feedback."""
     print("\n" + "="*60)
     print("TEST 3: Motion with Camera Feedback")
@@ -169,7 +169,7 @@ FIRST TIME ONLY:
 THEN:
   → GUI will open with connection settings
   → Serial port should auto-detect (COM6)
-  → Camera IP should default to 10.59.59.49
+  → Camera IP should default to 10.59.59.87
   → Click [🔗 Connect]
   → See live camera feed with status overlay
   → Control motion with spinboxes and buttons
@@ -191,7 +191,7 @@ def main():
         print("No ports found. Trying COM6...")
     
     port = "COM6"
-    camera_ip = "10.59.59.49"
+    camera_ip = "10.59.59.87"
     
     print(f"\nUsing:")
     print(f"  Serial Port: {port}")

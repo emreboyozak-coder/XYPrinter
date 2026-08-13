@@ -216,7 +216,7 @@ See [docs/wiring.md](docs/wiring.md) for detailed hardware connections.
 
 #### Camera Setup
 1. Install DroidCam app on Samsung S22
-2. Use the WiFi IP shown by DroidCam (currently 10.59.59.49), not the device IP
+2. Use the WiFi IP shown by DroidCam (currently 10.59.59.87), not the device IP
 3. Ensure phone and laptop are on same WiFi network
 4. Enter IP in GUI "Camera IP" field and click Connect
 

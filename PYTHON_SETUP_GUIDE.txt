@@ -225,7 +225,7 @@ When everything is working correctly:
 ✓ python --version shows "Python 3.x.x"
 ✓ start_gui.bat opens GUI window
 ✓ GUI shows "Disconnected" status
-✓ Camera IP field shows "10.59.59.49"
+✓ Camera IP field shows "10.59.59.87"
 ✓ Serial port dropdown shows COM6
 ✓ All buttons are ready to click
 

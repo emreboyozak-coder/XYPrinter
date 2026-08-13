@@ -259,7 +259,7 @@ class PCBPrinterGUI(QMainWindow):
 
         camera_connection = QGridLayout()
         camera_connection.addWidget(QLabel("WiFi IP"), 0, 0)
-        self.camera_ip_input = QLineEdit("10.59.59.49")
+        self.camera_ip_input = QLineEdit("10.59.59.87")
         camera_connection.addWidget(self.camera_ip_input, 0, 1)
         camera_connection.addWidget(QLabel("Port"), 0, 2)
         self.camera_port_input = QSpinBox()

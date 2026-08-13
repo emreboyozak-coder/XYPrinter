@@ -25,7 +25,7 @@ PCB Printer GUI - Quick Reference Card
 # [ ] Arduino UNO connected via USB (usually COM6)
 # [ ] DroidCam app running on Samsung S22
 # [ ] Phone on same WiFi as laptop
-# [ ] Note the WiFi IP from DroidCam (currently 10.59.59.49)
+# [ ] Note the WiFi IP from DroidCam (currently 10.59.59.87)
 
 
 # INTERFACE LAYOUT
@@ -61,7 +61,7 @@ PCB Printer GUI - Quick Reference Card
 
 # 1. CONNECT
 #    - Select serial port (COM6)
-#    - Enter camera IP (10.59.59.49)
+#    - Enter camera IP (10.59.59.87)
 #    - Click [🔗 Connect]
 #    - Wait for camera feed to appear
 
@@ -160,7 +160,7 @@ PCB Printer GUI - Quick Reference Card
 # # Connect
 # motion = MotionController()
 # motion.connect("COM6")
-# system = MotionWithFeedback(motion, camera_ip="10.59.59.49")
+# system = MotionWithFeedback(motion, camera_ip="10.59.59.87")
 #
 # # Live feed
 # system.display_live_feed()

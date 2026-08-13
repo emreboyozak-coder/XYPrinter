@@ -23,7 +23,7 @@ def setup_logging():
     )
 
 
-def run_camera_only_demo(camera_ip: str = "10.59.59.49"):
+def run_camera_only_demo(camera_ip: str = "10.59.59.87"):
     """Test camera connection and live feed only."""
     print(f"\n=== Camera Connection Test ===")
     print(f"Connecting to DroidCam at {camera_ip}:4747...")
@@ -44,7 +44,7 @@ def run_camera_only_demo(camera_ip: str = "10.59.59.49"):
         return False
 
 
-def run_motion_with_camera_demo(port: str = "COM6", camera_ip: str = "10.59.59.49"):
+def run_motion_with_camera_demo(port: str = "COM6", camera_ip: str = "10.59.59.87"):
     """Test integrated motion control with camera feedback."""
     print(f"\n=== Motion with Camera Feedback Test ===")
     print(f"Serial port: {port}")
