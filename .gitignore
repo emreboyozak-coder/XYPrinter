@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+.venv
+.venv*
+.pytest_cache/
+
+# VS Code
+.vscode/
+
+# PlatformIO / Arduino
+.pio/
+*.elf
+*.hex
+*.bin
+*.a
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/*.log
+
+# Local config
+config/*.yaml
+!config/*.example.yaml

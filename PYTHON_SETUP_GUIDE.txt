@@ -1,0 +1,253 @@
+===============================================================
+PCB PRINTER GUI - PYTHON SETUP GUIDE
+===============================================================
+
+PROBLEM: "Python not found" error when running start_gui.bat
+
+SOLUTION: You need to install Python properly with PATH support
+
+===============================================================
+OPTION 1: INSTALL PYTHON (Recommended - 5 minutes)
+===============================================================
+
+Step 1: Download Python
+  → Go to: https://www.python.org/downloads/
+  → Click "Download Python 3.10" (or 3.11/3.12)
+  → Choose Windows installer (64-bit recommended)
+
+Step 2: Run the installer
+  → Double-click the .exe file
+  → IMPORTANT: Check the box that says "Add Python to PATH"
+  → Click "Install Now"
+  → Wait for installation to complete
+
+Step 3: Restart your computer
+  → Close all applications
+  → Restart Windows
+
+Step 4: Run the GUI launcher
+  → After restart, double-click: start_gui.bat
+  → or: launch_simple.bat
+  → or: launch_gui.vbs
+
+===============================================================
+OPTION 2: QUICK TEST (Before installing Python)
+===============================================================
+
+To verify Python installation status:
+
+Method A - Command Prompt:
+  1. Press: Windows Key + R
+  2. Type: cmd
+  3. Click OK
+  4. Type: python --version
+  5. Press Enter
+  
+  Result:
+    ✓ If it shows "Python 3.x.x" → Python is installed
+    ✗ If it says "not recognized" → Install Python (Option 1)
+
+Method B - PowerShell:
+  1. Right-click Start Menu
+  2. Click "Windows PowerShell"
+  3. Type: python --version
+  4. Press Enter
+
+  Result:
+    ✓ If it shows "Python 3.x.x" → Python is installed
+    ✗ If error → Install Python (Option 1)
+
+===============================================================
+ALTERNATIVE: USE WINDOWS STORE PYTHON
+===============================================================
+
+If you want to use Windows Store Python (less reliable):
+
+Step 1: Open Windows Store
+  → Click Windows Start button
+  → Search "Microsoft Store"
+  → Click "Open"
+
+Step 2: Search for Python
+  → Click search box
+  → Type "Python 3.10" or "Python 3.11"
+  → Click first result
+
+Step 3: Install
+  → Click "Get" or "Install"
+  → Wait for download and installation
+
+Step 4: Verify
+  → Open Command Prompt or PowerShell
+  → Type: python --version
+  → Should show version number
+
+Step 5: Run GUI
+  → Go to: C:\Com_Printer\app
+  → Double-click: start_gui.bat
+
+===============================================================
+LAUNCHERS AVAILABLE (Try in this order)
+===============================================================
+
+1. start_gui.bat
+   → Most reliable after proper Python install
+   → Simple batch script
+   → Shows detailed error messages
+
+2. launch_simple.bat
+   → Simplified version
+   → Better for Windows Store Python
+   → Easier error diagnostics
+
+3. launch_gui.vbs
+   → VBScript launcher
+   → Works with both PATH and explicit Python paths
+   → Double-click or right-click → Run
+
+4. run_gui.py
+   → Direct Python script
+   → For experienced users
+   → Use: python run_gui.py
+
+5. launch_gui.py
+   → Python-based launcher
+   → More robust than batch files
+
+===============================================================
+WHAT TO DO AFTER PYTHON IS INSTALLED
+===============================================================
+
+1. Close all Command Prompt and PowerShell windows
+
+2. Open a NEW Command Prompt:
+   → Press Windows Key + R
+   → Type: cmd
+   → Click OK
+
+3. Test Python:
+   → Type: python --version
+   → Should show "Python 3.x.x"
+
+4. Install GUI dependencies (may take 2-5 minutes):
+   → Type: cd C:\Com_Printer\app
+   → Type: python -m pip install --upgrade pip
+   → Type: python -m pip install PyQt5 opencv-python numpy pyserial
+   → Wait for installation
+
+5. Launch GUI:
+   → Type: python launch_gui.py
+   → OR double-click: start_gui.bat
+
+===============================================================
+IF DEPENDENCIES INSTALLATION FAILS
+===============================================================
+
+Try these commands one at a time:
+
+python -m pip install --upgrade pip
+python -m pip install PyQt5
+python -m pip install opencv-python
+python -m pip install numpy
+python -m pip install pyserial
+
+If still failing, try:
+
+python -m pip install PyQt5 --upgrade --force-reinstall
+
+===============================================================
+QUICK TROUBLESHOOTING
+===============================================================
+
+SYMPTOM: "Python not found"
+  → Install Python with PATH (see OPTION 1 above)
+  → Restart computer
+  → Use launch_simple.bat instead
+
+SYMPTOM: "Module not found" (when GUI starts to launch)
+  → Install dependencies: python -m pip install PyQt5 opencv-python numpy pyserial
+  → Run setup_gui.py: python setup_gui.py
+
+SYMPTOM: GUI window won't open
+  → Try: python -m marker.gui.printer_control
+  → Check if other windows are covering it
+
+SYMPTOM: "Permission denied"
+  → Close all other instances of GUI
+  → Run launcher as Administrator (right-click → Run as Administrator)
+
+SYMPTOM: Application crashes immediately
+  → Run setup_gui.py to check dependencies
+  → Check system resource (disk space, RAM)
+
+===============================================================
+REINSTALL PYTHON (Nuclear Option)
+===============================================================
+
+If nothing works, completely reinstall:
+
+1. Uninstall current Python:
+   → Settings → Apps → Apps & features
+   → Search "Python"
+   → Click each Python entry and click "Uninstall"
+   → Click "Remove"
+   → Restart computer
+
+2. Delete Python AppData (if exists):
+   → Press Windows Key + R
+   → Type: %appdata%
+   → Navigate to: Local\Programs\Python
+   → Delete any Python folders
+   → Restart computer
+
+3. Install fresh Python:
+   → Download from https://www.python.org/downloads/
+   → Run installer
+   → CHECK: "Add Python to PATH" (required)
+   → Click "Install Now"
+   → Restart computer
+
+4. Test:
+   → Open Command Prompt
+   → Type: python --version
+   → Should show version
+
+5. Launch GUI:
+   → cd C:\Com_Printer\app
+   → python launch_gui.py
+
+===============================================================
+SUCCESS INDICATORS
+===============================================================
+
+When everything is working correctly:
+
+✓ python --version shows "Python 3.x.x"
+✓ start_gui.bat opens GUI window
+✓ GUI shows "Disconnected" status
+✓ Camera IP field shows "10.59.59.49"
+✓ Serial port dropdown shows COM6
+✓ All buttons are ready to click
+
+===============================================================
+NEED HELP?
+===============================================================
+
+1. Check the error message carefully - it often explains the fix
+2. Restart your computer after any installation
+3. Use Command Prompt instead of PowerShell (more reliable)
+4. Make sure running as Administrator if prompted
+5. Check that no firewall is blocking Python
+
+===============================================================
+FILE LOCATIONS
+===============================================================
+
+GUI Application:    C:\Com_Printer\app\
+Launchers:          C:\Com_Printer\app\start_gui.bat
+                    C:\Com_Printer\app\launch_simple.bat
+                    C:\Com_Printer\app\launch_gui.vbs
+Documentation:      C:\Com_Printer\GUI_QUICK_REFERENCE.py
+                    C:\Com_Printer\README.md
+
+===============================================================

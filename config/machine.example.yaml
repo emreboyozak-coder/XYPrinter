@@ -1,0 +1,23 @@
+serial:
+  baud_rate: 115200
+  command_timeout_s: 5.0
+  motion_timeout_s: 30.0
+
+axes:
+  x:
+    steps_per_mm: 320.0
+    max_speed_mm_s: 60.0
+    acceleration_mm_s2: 150.0
+    travel_mm: 300.0
+    home_direction: -1
+
+  y:
+    steps_per_mm: 320.0
+    max_speed_mm_s: 60.0
+    acceleration_mm_s2: 150.0
+    travel_mm: 300.0
+    home_direction: -1
+
+printer_trigger:
+  active_level: LOW
+  pulse_ms: 20

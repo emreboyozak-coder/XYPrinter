@@ -1,0 +1,18 @@
+panel:
+  name: PANEL_20W_ACFW_2L_V2.3
+  units: mm
+  width: 120.0
+  height: 147.0
+
+boards:
+  - id: CORE3
+    print_point: [26.400, 126.975]
+    fiducials:
+      - [30.875, 138.875]
+      - [34.925, 119.425]
+
+  - id: CORE3_1
+    print_point: [53.400, 126.975]
+    fiducials:
+      - [57.875, 138.875]
+      - [61.925, 119.425]
