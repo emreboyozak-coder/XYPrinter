@@ -5,11 +5,13 @@ from __future__ import annotations
 import logging
 import sys
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 import cv2
+import numpy as np
 from PyQt5 import QtWidgets
 from PyQt5.QtCore import QPoint, QRect, QSize, Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtGui import QFont, QImage, QPainter, QPen, QPixmap
@@ -150,11 +152,13 @@ class MotionThread(QThread):
 
 
 class CameraThread(QThread):
-    """Reads DroidCam and applies two-zone template alignment off the GUI thread."""
+    """Drains DroidCam continuously and analyzes only the newest available frame."""
+
+    ANALYSIS_INTERVAL_S = 0.2
 
     frame_ready = pyqtSignal(int, QImage)
     connection_changed = pyqtSignal(int, bool, str)
-    alignment_measurement_changed = pyqtSignal(int, float, float, float, float, float, float, float, float)
+    alignment_measurement_changed = pyqtSignal(int, float, float, float, float, float, float, float, float, float, float)
     alignment_status_changed = pyqtSignal(int, str)
     detection_counts_changed = pyqtSignal(int, int, int)
 
@@ -166,12 +170,15 @@ class CameraThread(QThread):
         self._running = True
         self._frame_lock = threading.Lock()
         self._latest_frame: Optional[object] = None
+        self._latest_frame_serial = 0
+        self._frame_available = threading.Event()
         self.aligner = PrintZoneAligner()
         self.loaded_saved_zones = self.aligner.load(template_path)
         self._last_status = ""
 
     def stop(self) -> None:
         self._running = False
+        self._frame_available.set()
 
     def teach_zone(self, index: int, rectangle: Rectangle, append: bool) -> None:
         with self._frame_lock:
@@ -180,6 +187,12 @@ class CameraThread(QThread):
             frame = self._latest_frame.copy()
         self.aligner.teach(index, frame, rectangle, append=append)
         self.aligner.save(self.template_path)
+
+    def latest_frame_copy(self):  # type: ignore[no-untyped-def]
+        with self._frame_lock:
+            if self._latest_frame is None:
+                raise RuntimeError("No camera frame is available")
+            return self._latest_frame.copy()
 
     def teach_negative(self, index: int, rectangle: Rectangle) -> None:
         with self._frame_lock:
@@ -193,12 +206,12 @@ class CameraThread(QThread):
         self.aligner.clear()
         self.template_path.unlink(missing_ok=True)
 
-    def save_latest_frame(self, path: Path, x: float, y: float) -> tuple[int, int]:
+    def save_latest_frame(self, path: Path, x: float, y: float) -> tuple[int, int, Optional[float], Optional[float]]:
         with self._frame_lock:
             if self._latest_frame is None:
                 raise RuntimeError("No camera frame is available")
             raw_frame = self._latest_frame.copy()
-        frame, _, _ = self.aligner.process(raw_frame)
+        frame, measurement, _ = self.aligner.process(raw_frame)
         counts = self.aligner.detection_counts()
         cv2.putText(
             frame,
@@ -212,7 +225,9 @@ class CameraThread(QThread):
         path.parent.mkdir(parents=True, exist_ok=True)
         if not cv2.imwrite(str(path), frame):
             raise RuntimeError(f"Could not write snapshot: {path}")
-        return counts
+        primary_x = measurement.primary_x if measurement is not None else None
+        primary_y = measurement.primary_y if measurement is not None else None
+        return counts[0], counts[1], primary_x, primary_y
 
     def _emit_status(self, status: str) -> None:
         if status != self._last_status:
@@ -223,6 +238,7 @@ class CameraThread(QThread):
         camera = cv2.VideoCapture()
         camera.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 3000)
         camera.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 3000)
+        camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         opened = camera.open(self.url, cv2.CAP_FFMPEG)
         if not opened:
             camera.release()
@@ -234,11 +250,28 @@ class CameraThread(QThread):
             self.connection_changed.emit(self.session, False, f"Camera stream did not return a frame: {self.url}")
             return
 
+        camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        with self._frame_lock:
+            self._latest_frame = frame.copy()
+            self._latest_frame_serial += 1
+        self._frame_available.set()
         self.connection_changed.emit(self.session, True, f"Camera connected: {self.url}")
+        capture_thread = threading.Thread(target=self._capture_latest_frames, args=(camera,), daemon=True)
+        capture_thread.start()
+        processed_serial = -1
+        next_analysis_at = 0.0
         while self._running:
+            self._frame_available.wait(timeout=0.25)
+            self._frame_available.clear()
+            delay = next_analysis_at - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
             with self._frame_lock:
-                self._latest_frame = frame.copy()
-
+                if self._latest_frame is None or self._latest_frame_serial == processed_serial:
+                    continue
+                frame = self._latest_frame.copy()
+                processed_serial = self._latest_frame_serial
+            next_analysis_at = time.monotonic() + self.ANALYSIS_INTERVAL_S
             display_frame, measurement, status = self.aligner.process(frame)
             pcb_count, core_count = self.aligner.detection_counts()
             self.detection_counts_changed.emit(self.session, pcb_count, core_count)
@@ -259,17 +292,31 @@ class CameraThread(QThread):
                     measurement.score_2,
                     float(center_x),
                     float(center_y),
+                    float(measurement.primary_x if measurement.primary_x is not None else measurement.midpoint_x),
+                    float(measurement.primary_y if measurement.primary_y is not None else measurement.midpoint_y),
                 )
 
             rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
             height, width, channels = rgb.shape
             self.frame_ready.emit(self.session, QImage(rgb.data, width, height, channels * width, QImage.Format_RGB888).copy())
+        self._running = False
+        capture_thread.join(timeout=4.0)
+        camera.release()
+
+    def _capture_latest_frames(self, camera: cv2.VideoCapture) -> None:
+        """Continuously drain DroidCam so analysis never works through stale buffered frames."""
+        while self._running:
             ok, frame = camera.read()
             if not ok or frame is None:
                 self._emit_status("Camera stream interrupted")
-                break
-
-        camera.release()
+                self._running = False
+                self._frame_available.set()
+                return
+            with self._frame_lock:
+                self._latest_frame = frame.copy()
+                self._latest_frame_serial += 1
+            self._frame_available.set()
+            time.sleep(0.001)
 
 
 class PCBPrinterGUI(QMainWindow):
@@ -304,17 +351,23 @@ class PCBPrinterGUI(QMainWindow):
         self.camera_center_y: Optional[float] = None
         self.detected_pcb_count = 0
         self.detected_core_count = 0
+        self._full_layout_capture_saved = False
+        self._reference_primary_core: Optional[tuple[float, float]] = None
+        self._reference_machine_position: Optional[tuple[float, float]] = None
+        self._auto_center_phase: Optional[str] = None
+        self._auto_center_y_correction: Optional[float] = None
         self._teach_zone_request: Optional[tuple[int, bool]] = None
         self._reject_core_request: Optional[int] = None
         self._pending_calibration: Optional[tuple[float, float, float]] = None
         self._pending_y_calibration: Optional[tuple[float, float, float]] = None
+        self._pending_calibration_frame: Optional[object] = None
         self._measurement_serial = 0
         self._calibration_wait_serial: Optional[int] = None
 
         self._build_ui()
         logging.basicConfig(level=logging.INFO)
         QTimer.singleShot(0, self.connect_camera)
-        QTimer.singleShot(120_000, self.capture_startup_position)
+        QTimer.singleShot(30_000, self.capture_startup_position)
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -583,7 +636,7 @@ class PCBPrinterGUI(QMainWindow):
 
     def capture_startup_position(self) -> None:
         if not self.camera_thread or not self.camera_thread.isRunning():
-            message = "The 2-minute startup capture failed because the camera is not connected."
+            message = "The 30-second startup capture failed because the camera is not connected."
             self.status_label.setText(message)
             QMessageBox.warning(self, "Startup Capture", message)
             return
@@ -591,9 +644,9 @@ class PCBPrinterGUI(QMainWindow):
         filename = f"startup_{timestamp}_X{self.current_x:+.3f}_Y{self.current_y:+.3f}.jpg"
         path = self.STARTUP_CAPTURE_DIR / filename
         try:
-            pcb_count, core_count = self.camera_thread.save_latest_frame(path, self.current_x, self.current_y)
+            pcb_count, core_count, primary_x, primary_y = self.camera_thread.save_latest_frame(path, self.current_x, self.current_y)
         except Exception as exc:
-            message = f"The 2-minute startup capture failed: {exc}"
+            message = f"The 30-second startup capture failed: {exc}"
             self.status_label.setText(message)
             QMessageBox.warning(self, "Startup Capture", message)
             return
@@ -603,6 +656,9 @@ class PCBPrinterGUI(QMainWindow):
         )
         self.status_label.setText(message)
         if pcb_count == self.EXPECTED_PCB_COUNT and core_count == self.EXPECTED_CORE_COUNT:
+            if primary_x is not None and primary_y is not None:
+                self._reference_primary_core = (primary_x, primary_y)
+                self._reference_machine_position = (self.current_x, self.current_y)
             QMessageBox.information(self, "Startup Capture Complete", message + "\nCounts are correct.")
         else:
             QMessageBox.warning(
@@ -617,6 +673,37 @@ class PCBPrinterGUI(QMainWindow):
             return
         self.detected_pcb_count = pcb_count
         self.detected_core_count = core_count
+        if (
+            not self._full_layout_capture_saved
+            and pcb_count == self.EXPECTED_PCB_COUNT
+            and core_count == self.EXPECTED_CORE_COUNT
+        ):
+            self._full_layout_capture_saved = True
+            QTimer.singleShot(0, self.capture_full_layout)
+
+    def capture_full_layout(self) -> None:
+        if not self.camera_thread or not self.camera_thread.isRunning():
+            self._full_layout_capture_saved = False
+            return
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = self.STARTUP_CAPTURE_DIR / f"all_pcbs_cores_{timestamp}.jpg"
+        try:
+            pcb_count, core_count, primary_x, primary_y = self.camera_thread.save_latest_frame(path, self.current_x, self.current_y)
+        except Exception as exc:
+            self._full_layout_capture_saved = False
+            self.status_label.setText(f"Could not save the complete PCB/core photo: {exc}")
+            return
+        if pcb_count != self.EXPECTED_PCB_COUNT or core_count != self.EXPECTED_CORE_COUNT:
+            self._full_layout_capture_saved = False
+            return
+        if primary_x is None or primary_y is None:
+            self._full_layout_capture_saved = False
+            return
+        self._reference_primary_core = (primary_x, primary_y)
+        self._reference_machine_position = (self.current_x, self.current_y)
+        message = f"All {pcb_count} PCBs and {core_count} cores were detected and saved.\n{path}"
+        self.status_label.setText(message)
+        QMessageBox.information(self, "Complete PCB/Core Capture", message)
 
     def on_camera_connection_changed(self, session: int, connected: bool, message: str) -> None:
         if session != self._camera_session:
@@ -737,11 +824,11 @@ class PCBPrinterGUI(QMainWindow):
             return
         self.alignment_label.setText(message)
 
-    def on_alignment_measurement(self, session: int, midpoint_x: float, midpoint_y: float, error_x: float, error_y: float, score_1: float, score_2: float, center_x: float, center_y: float) -> None:
+    def on_alignment_measurement(self, session: int, midpoint_x: float, midpoint_y: float, error_x: float, error_y: float, score_1: float, score_2: float, center_x: float, center_y: float, primary_x: float, primary_y: float) -> None:
         if session != self._camera_session:
             return
         self._measurement_serial += 1
-        self.last_measurement = AlignmentMeasurement(midpoint_x, midpoint_y, error_x, error_y, score_1, score_2)
+        self.last_measurement = AlignmentMeasurement(midpoint_x, midpoint_y, error_x, error_y, score_1, score_2, primary_x, primary_y)
         self.camera_center_x = center_x
         self.camera_center_y = center_y
         self.alignment_label.setText(
@@ -770,12 +857,22 @@ class PCBPrinterGUI(QMainWindow):
         self._update_motion_ui()
         if self._pending_calibration:
             self._calibration_wait_serial = self._measurement_serial
-            self.status_label.setText("Calibration move complete. Waiting 5 seconds for an updated camera frame...")
-            QTimer.singleShot(5000, self.finish_x_calibration)
+            self.status_label.setText("X calibration move complete. Waiting 30 seconds for an updated camera frame...")
+            QTimer.singleShot(30_000, self.finish_x_calibration)
         elif self._pending_y_calibration:
             self._calibration_wait_serial = self._measurement_serial
-            self.status_label.setText("Y calibration move complete. Waiting 5 seconds for an updated camera frame...")
-            QTimer.singleShot(5000, self.finish_y_calibration)
+            self.status_label.setText("Y calibration move complete. Waiting 30 seconds for an updated camera frame...")
+            QTimer.singleShot(30_000, self.finish_y_calibration)
+        elif self._auto_center_phase == "x":
+            self._auto_center_phase = "waiting_y"
+            self.status_label.setText("PCB 1 Core 1 X centering complete. Waiting 30 seconds before Y centering...")
+            QTimer.singleShot(30_000, self._continue_auto_center_y)
+        elif self._auto_center_phase == "y":
+            self._auto_center_phase = None
+            self._auto_center_y_correction = None
+            message = "PCB 1 Core 1 automatic X/Y centering is complete."
+            self.status_label.setText(message)
+            QMessageBox.information(self, "Automatic Centering Complete", message)
         else:
             self.status_label.setText("Move complete")
 
@@ -783,11 +880,19 @@ class PCBPrinterGUI(QMainWindow):
         self._pending_calibration = None
         self._pending_y_calibration = None
         self._calibration_wait_serial = None
+        self._pending_calibration_frame = None
+        self._auto_center_phase = None
+        self._auto_center_y_correction = None
         self.status_label.setText(f"Move failed: {error}")
         self._update_motion_ui()
 
     def calibrate_x(self) -> None:
-        if not self.last_measurement:
+        if not self.last_measurement or not self.camera_thread:
+            return
+        try:
+            self._pending_calibration_frame = self.camera_thread.latest_frame_copy()
+        except RuntimeError as exc:
+            self.status_label.setText(f"X calibration failed: {exc}")
             return
         self.x_axis_camera_response = None
         self._pending_calibration = (
@@ -800,18 +905,13 @@ class PCBPrinterGUI(QMainWindow):
     def finish_x_calibration(self) -> None:
         if not self._pending_calibration:
             return
-        if self._calibration_wait_serial is not None and self._measurement_serial <= self._calibration_wait_serial:
-            self.status_label.setText("Still waiting for a new camera frame after the X calibration move...")
-            QTimer.singleShot(1000, self.finish_x_calibration)
-            return
-        start_x, start_y, distance_mm = self._pending_calibration
+        _, _, distance_mm = self._pending_calibration
         self._pending_calibration = None
         self._calibration_wait_serial = None
-        if not self.last_measurement:
-            self.status_label.setText("Calibration failed: no current print-zone detection.")
+        shifts = self._calibration_frame_shift()
+        if shifts is None:
             return
-        horizontal_pixel_shift = self.last_measurement.midpoint_x - start_x
-        vertical_pixel_shift = self.last_measurement.midpoint_y - start_y
+        horizontal_pixel_shift, vertical_pixel_shift, response = shifts
         if abs(horizontal_pixel_shift) < 5.0 and abs(vertical_pixel_shift) < 5.0:
             self.status_label.setText("Calibration failed: camera saw too little movement from the X axis.")
             return
@@ -829,8 +929,9 @@ class PCBPrinterGUI(QMainWindow):
             else ", center-line response unavailable"
         )
         self.x_calibration_label.setText(f"X calibration: {horizontal_status}{center_status}")
-        self.status_label.setText("X calibration complete. Calibrate Y to enable full camera centering.")
+        self.status_label.setText(f"X calibration complete from whole-frame motion (confidence {response:.2f}). Calibrate Y next.")
         self._update_motion_ui()
+        QMessageBox.information(self, "X Calibration Complete", "X axis calibration completed using the updated camera image.")
 
     def align_x(self) -> None:
         if not self.last_measurement or not self.pixels_per_mm_x:
@@ -843,7 +944,12 @@ class PCBPrinterGUI(QMainWindow):
         self._start_move(self.current_x + correction_mm, self.current_y, "Aligning X")
 
     def calibrate_y(self) -> None:
-        if not self.last_measurement:
+        if not self.last_measurement or not self.camera_thread:
+            return
+        try:
+            self._pending_calibration_frame = self.camera_thread.latest_frame_copy()
+        except RuntimeError as exc:
+            self.status_label.setText(f"Y calibration failed: {exc}")
             return
         self.y_axis_camera_response = None
         self._pending_y_calibration = (
@@ -856,18 +962,13 @@ class PCBPrinterGUI(QMainWindow):
     def finish_y_calibration(self) -> None:
         if not self._pending_y_calibration:
             return
-        if self._calibration_wait_serial is not None and self._measurement_serial <= self._calibration_wait_serial:
-            self.status_label.setText("Still waiting for a new camera frame after the Y calibration move...")
-            QTimer.singleShot(1000, self.finish_y_calibration)
-            return
-        start_x, start_y, distance_mm = self._pending_y_calibration
+        _, _, distance_mm = self._pending_y_calibration
         self._pending_y_calibration = None
         self._calibration_wait_serial = None
-        if not self.last_measurement:
-            self.status_label.setText("Y calibration failed: no current frame detection.")
+        shifts = self._calibration_frame_shift()
+        if shifts is None:
             return
-        horizontal_shift = self.last_measurement.midpoint_x - start_x
-        vertical_shift = self.last_measurement.midpoint_y - start_y
+        horizontal_shift, vertical_shift, response = shifts
         if abs(horizontal_shift) < 5.0 and abs(vertical_shift) < 5.0:
             self.status_label.setText("Y calibration failed: camera saw too little movement from the Y axis.")
             return
@@ -875,10 +976,131 @@ class PCBPrinterGUI(QMainWindow):
         self.y_calibration_label.setText(
             f"Y calibration: X {self.y_axis_camera_response[0]:.2f}, Y {self.y_axis_camera_response[1]:.2f} px/mm"
         )
-        self.status_label.setText("Y calibration complete. Full camera centering is ready.")
+        self.status_label.setText(f"Y calibration complete from whole-frame motion (confidence {response:.2f}).")
         self._update_motion_ui()
+        QMessageBox.information(self, "Y Calibration Complete", "Y axis calibration completed using the updated camera image.")
+        QTimer.singleShot(0, self.start_auto_center_primary_core)
 
-    def _camera_center_corrections(self) -> Optional[tuple[float, float]]:
+    def _calibration_frame_shift(self) -> Optional[tuple[float, float, float]]:
+        if self._pending_calibration_frame is None or not self.camera_thread:
+            self.status_label.setText("Calibration failed: the before-move camera frame is unavailable.")
+            return None
+        try:
+            after_frame = self.camera_thread.latest_frame_copy()
+        except RuntimeError as exc:
+            self.status_label.setText(f"Calibration failed: {exc}")
+            return None
+        before_frame = self._pending_calibration_frame
+        self._pending_calibration_frame = None
+        before_gray = cv2.equalizeHist(cv2.cvtColor(before_frame, cv2.COLOR_BGR2GRAY))
+        after_gray = cv2.equalizeHist(cv2.cvtColor(after_frame, cv2.COLOR_BGR2GRAY))
+        if before_gray.shape != after_gray.shape:
+            after_gray = cv2.resize(after_gray, (before_gray.shape[1], before_gray.shape[0]))
+        window = cv2.createHanningWindow((before_gray.shape[1], before_gray.shape[0]), cv2.CV_32F)
+        phase_shift, _ = cv2.phaseCorrelate(before_gray.astype("float32"), after_gray.astype("float32"), window)
+        points_before = cv2.goodFeaturesToTrack(
+            before_gray,
+            maxCorners=1200,
+            qualityLevel=0.01,
+            minDistance=7,
+            blockSize=7,
+        )
+        if points_before is None or len(points_before) < 30:
+            self.status_label.setText("Calibration failed: too few trackable image features.")
+            return None
+        initial_points = points_before + np.array(phase_shift, dtype=np.float32).reshape(1, 1, 2)
+        points_after, forward_status, _ = cv2.calcOpticalFlowPyrLK(
+            before_gray,
+            after_gray,
+            points_before,
+            initial_points,
+            winSize=(31, 31),
+            maxLevel=4,
+            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 40, 0.01),
+            flags=cv2.OPTFLOW_USE_INITIAL_FLOW,
+        )
+        if points_after is None or forward_status is None:
+            self.status_label.setText("Calibration failed: optical-flow tracking did not converge.")
+            return None
+        points_back, backward_status, _ = cv2.calcOpticalFlowPyrLK(
+            after_gray,
+            before_gray,
+            points_after,
+            None,
+            winSize=(31, 31),
+            maxLevel=4,
+            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 40, 0.01),
+        )
+        if points_back is None or backward_status is None:
+            self.status_label.setText("Calibration failed: reverse optical-flow validation failed.")
+            return None
+        round_trip_error = np.linalg.norm(points_before.reshape(-1, 2) - points_back.reshape(-1, 2), axis=1)
+        valid = (forward_status.ravel() == 1) & (backward_status.ravel() == 1) & (round_trip_error < 1.5)
+        source = points_before.reshape(-1, 2)[valid]
+        destination = points_after.reshape(-1, 2)[valid]
+        if len(source) < 25:
+            self.status_label.setText("Calibration failed: too few common features remained inside the image.")
+            return None
+        transform, inlier_mask = cv2.estimateAffinePartial2D(
+            source,
+            destination,
+            method=cv2.RANSAC,
+            ransacReprojThreshold=2.5,
+            maxIters=4000,
+            confidence=0.995,
+            refineIters=20,
+        )
+        if transform is None or inlier_mask is None:
+            self.status_label.setText("Calibration failed: RANSAC could not find consistent image motion.")
+            return None
+        inlier_count = int(inlier_mask.sum())
+        inlier_ratio = inlier_count / len(source)
+        scale = float(np.hypot(transform[0, 0], transform[0, 1]))
+        rotation_degrees = float(np.degrees(np.arctan2(transform[1, 0], transform[0, 0])))
+        if inlier_count < 20 or inlier_ratio < 0.45:
+            self.status_label.setText(f"Calibration failed: only {inlier_count}/{len(source)} feature tracks agreed.")
+            return None
+        if not 0.98 <= scale <= 1.02 or abs(rotation_degrees) > 2.0:
+            self.status_label.setText("Calibration failed: detected motion was not a clean X/Y translation.")
+            return None
+        return float(transform[0, 2]), float(transform[1, 2]), float(inlier_ratio)
+
+    def start_auto_center_primary_core(self) -> None:
+        if self._reference_primary_core is None or self._reference_machine_position is None:
+            self.status_label.setText("Could not center PCB 1 Core 1: the complete 20-PCB/40-core reference photo is not available.")
+            return
+        corrections = self._camera_center_corrections(self._reference_primary_core)
+        if corrections is None:
+            self.status_label.setText("Could not center PCB 1 Core 1 from the saved reference photo.")
+            return
+        correction_x, correction_y = corrections
+        target_x = self._reference_machine_position[0] + correction_x
+        target_y = self._reference_machine_position[1] + correction_y
+        self._auto_center_y_correction = target_y
+        if abs(target_x - self.current_x) < 0.05:
+            self._auto_center_phase = "waiting_y"
+            QTimer.singleShot(0, self._continue_auto_center_y)
+            return
+        self._auto_center_phase = "x"
+        self._start_move(target_x, self.current_y, "Centering PCB 1 Core 1 on X from saved photo")
+
+    def _continue_auto_center_y(self) -> None:
+        if self._auto_center_y_correction is None:
+            self._auto_center_phase = None
+            self.status_label.setText("Could not center PCB 1 Core 1 on Y: saved-photo correction is unavailable.")
+            return
+        target_y = self._auto_center_y_correction
+        if abs(target_y - self.current_y) < 0.05:
+            self._auto_center_phase = None
+            self._auto_center_y_correction = None
+            message = "PCB 1 Core 1 is already centered on Y; automatic centering is complete."
+            self.status_label.setText(message)
+            QMessageBox.information(self, "Automatic Centering Complete", message)
+            return
+        self._auto_center_phase = "y"
+        self._start_move(self.current_x, target_y, "Centering PCB 1 Core 1 on Y from saved photo")
+
+    def _camera_center_corrections(self, target: Optional[tuple[float, float]] = None) -> Optional[tuple[float, float]]:
         if (
             not self.last_measurement
             or self.x_axis_camera_response is None
@@ -887,8 +1109,10 @@ class PCBPrinterGUI(QMainWindow):
             or self.camera_center_y is None
         ):
             return
-        error_x = self.camera_center_x - self.last_measurement.midpoint_x
-        error_y = self.camera_center_y - self.last_measurement.midpoint_y
+        target_x = target[0] if target is not None else (self.last_measurement.primary_x if self.last_measurement.primary_x is not None else self.last_measurement.midpoint_x)
+        target_y = target[1] if target is not None else (self.last_measurement.primary_y if self.last_measurement.primary_y is not None else self.last_measurement.midpoint_y)
+        error_x = self.camera_center_x - target_x
+        error_y = self.camera_center_y - target_y
         x_dx, x_dy = self.x_axis_camera_response
         y_dx, y_dy = self.y_axis_camera_response
         determinant = x_dx * y_dy - y_dx * x_dy

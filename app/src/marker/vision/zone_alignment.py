@@ -30,6 +30,8 @@ class AlignmentMeasurement:
     error_y: float
     score_1: float
     score_2: float
+    primary_x: float | None = None
+    primary_y: float | None = None
 
 
 @dataclass(frozen=True)
@@ -210,46 +212,83 @@ class PrintZoneAligner:
 
         board_detections = detected_by_type[1]
         core_detections = detected_by_type[0]
-        if zones[1] is not None:
-            core_detections = [
-                detection
-                for detection in core_detections
-                if any(self._contains(board, detection[0].center) for board, _ in board_detections)
-            ]
-
         board_detections = self._reading_order(board_detections)
-        core_detections = self._reading_order(core_detections)
+        numbered_cores: list[tuple[int, int, Rectangle, float]] = []
+        incomplete_boards = 0
+        if zones[1] is not None:
+            for board_number, (board, _) in enumerate(board_detections, start=1):
+                inside = [detection for detection in core_detections if self._contains(board, detection[0].center)]
+                strongest_two = sorted(inside, key=lambda detection: detection[1], reverse=True)[:2]
+                ordered_two = self._reading_order(strongest_two)
+                if len(ordered_two) != 2:
+                    incomplete_boards += 1
+                for core_number, (core, score) in enumerate(ordered_two, start=1):
+                    numbered_cores.append((board_number, core_number, core, score))
+        else:
+            for core_number, (core, score) in enumerate(self._reading_order(core_detections), start=1):
+                numbered_cores.append((0, core_number, core, score))
 
-        for board_number, (board, score) in enumerate(board_detections, start=1):
-            cv2.rectangle(annotated, (board.x, board.y), (board.x + board.width, board.y + board.height), (255, 80, 0), 3)
-            cv2.putText(annotated, f"PCB {board_number}", (board.x, max(18, board.y - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 80, 0), 2)
+        for board_number, (board, _) in enumerate(board_detections, start=1):
+            board_core_count = sum(1 for pcb_number, _, _, _ in numbered_cores if pcb_number == board_number)
+            color = (255, 80, 0) if board_core_count == 2 else (0, 0, 255)
+            cv2.rectangle(annotated, (board.x, board.y), (board.x + board.width, board.y + board.height), color, 3)
+            cv2.putText(annotated, f"PCB {board_number} ({board_core_count}/2)", (board.x, max(18, board.y - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-        if not core_detections:
+        if not numbered_cores:
             with self._lock:
                 self._last_detection_counts = (len(board_detections), 0)
             board_status = f" Detected PCBs: {len(board_detections)}." if zones[1] is not None else ""
             return annotated, None, f"No taught PCB cores detected.{board_status}"
 
-        for core_number, (match, score) in enumerate(core_detections, start=1):
+        for pcb_number, core_number, match, score in numbered_cores:
             color = (0, 255, 0)
             cv2.rectangle(annotated, (match.x, match.y), (match.x + match.width, match.y + match.height), color, 2)
-            cv2.putText(annotated, f"Core {core_number}", (match.x, max(16, match.y - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            label = f"PCB {pcb_number} Core {core_number}" if pcb_number else f"Core {core_number}"
+            cv2.putText(annotated, label, (match.x, max(16, match.y - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
-        detected_x = sum(match.center[0] for match, _ in core_detections) / len(core_detections)
-        detected_y = sum(match.center[1] for match, _ in core_detections) / len(core_detections)
         height, width = frame.shape[:2]
+        primary_core = next(
+            (match for pcb_number, core_number, match, _ in numbered_cores if pcb_number == 1 and core_number == 1),
+            numbered_cores[0][2],
+        )
+        calibration_core = primary_core
+        calibration_board_number = 1
+        if board_detections:
+            calibration_board_number = min(
+                range(1, len(board_detections) + 1),
+                key=lambda number: (
+                    board_detections[number - 1][0].center[0] - width / 2.0
+                ) ** 2
+                + (
+                    board_detections[number - 1][0].center[1] - height / 2.0
+                ) ** 2,
+            )
+            calibration_core = next(
+                (
+                    match
+                    for pcb_number, core_number, match, _ in numbered_cores
+                    if pcb_number == calibration_board_number and core_number == 1
+                ),
+                primary_core,
+            )
+        detected_x, detected_y = calibration_core.center
+        cv2.circle(annotated, (round(detected_x), round(detected_y)), 7, (255, 0, 255), 2)
+        cv2.putText(annotated, "TRACK", (round(detected_x) + 9, round(detected_y) - 9), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 2)
         measurement = AlignmentMeasurement(
             detected_x,
             detected_y,
             width / 2.0 - detected_x,
             height / 2.0 - detected_y,
-            max(score for _, score in core_detections),
+            max(score for _, _, _, score in numbered_cores),
             max((score for _, score in board_detections), default=0.0),
+            primary_core.center[0],
+            primary_core.center[1],
         )
-        cv2.putText(annotated, f"PCBs: {len(board_detections)}  Cores: {len(core_detections)}", (12, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
+        detected_core_count = len(numbered_cores)
+        cv2.putText(annotated, f"PCBs: {len(board_detections)}  Cores: {detected_core_count}  Incomplete: {incomplete_boards}", (12, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
         with self._lock:
-            self._last_detection_counts = (len(board_detections), len(core_detections))
-        return annotated, measurement, f"Detected {len(board_detections)} PCBs and {len(core_detections)} cores."
+            self._last_detection_counts = (len(board_detections), detected_core_count)
+        return annotated, measurement, f"Detected {len(board_detections)} PCBs and {detected_core_count} cores; visual tracking reference is PCB {calibration_board_number} Core 1; {incomplete_boards} PCBs are incomplete."
 
     @staticmethod
     def _contains(rectangle: Rectangle, point: tuple[float, float]) -> bool:

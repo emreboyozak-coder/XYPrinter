@@ -25,8 +25,8 @@ def test_detector_finds_repeated_cores_across_multiple_boards() -> None:
 
     assert measurement is not None, status
     assert "4 cores" in status
-    assert abs(measurement.midpoint_x - 313.0) < 2
-    assert abs(measurement.midpoint_y - 245.5) < 2
+    assert abs(measurement.midpoint_x - 113.0) < 2
+    assert abs(measurement.midpoint_y - 125.5) < 2
 
 
 def test_context_keeps_a_plain_print_zone_distinct() -> None:
