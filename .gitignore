@@ -25,6 +25,7 @@ Thumbs.db
 # Logs
 logs/*.log
 camera_live_frame.jpg
+snapshots/
 
 # Local config
 config/*.yaml

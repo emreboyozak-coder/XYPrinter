@@ -1,4 +1,4 @@
-"""Persistent multi-sample template alignment for two PCB print zones."""
+"""Persistent multi-sample detection for repeated PCB cores."""
 
 from __future__ import annotations
 
@@ -43,28 +43,30 @@ class ZoneSample:
 
 @dataclass(frozen=True)
 class LearnedZone:
-    """Fixed red target guide and all visual examples learned for that target."""
+    """Fixed target guide and all visual examples learned for that target."""
 
     guide: Rectangle
     samples: tuple[ZoneSample, ...]
 
 
 class PrintZoneAligner:
-    """Tracks two targets using saved examples and their common X/Y translation."""
+    """Detects repeated PCBs and finds cores only inside those boards."""
 
-    _MIN_SCORE = 0.52
-    _CONTEXT_PADDING_PX = 40
-    _MAX_PAIR_SHIFT_DIFFERENCE_PX = 16.0
+    _MIN_SCORE = 0.68
+    _CONTEXT_PADDING_PX = 0
+    _MAX_DETECTIONS_PER_SAMPLE = 100
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._zones: list[LearnedZone | None] = [None, None]
+        self._negative_samples: list[list[np.ndarray]] = [[], []]
+        self._last_detection_counts = (0, 0)
 
     def teach(self, index: int, frame: np.ndarray, rectangle: Rectangle, *, append: bool = False) -> None:
         if index not in (0, 1):
-            raise ValueError("Zone index must be 0 or 1")
+            raise ValueError("Core type index must be 0 or 1")
         if rectangle.width < 12 or rectangle.height < 12:
-            raise ValueError("Select a larger print zone")
+            raise ValueError("Select a larger PCB core area")
 
         height, width = frame.shape[:2]
         if rectangle.x < 0 or rectangle.y < 0 or rectangle.x + rectangle.width > width or rectangle.y + rectangle.height > height:
@@ -90,23 +92,54 @@ class PrintZoneAligner:
         with self._lock:
             return tuple(len(zone.samples) if zone else 0 for zone in self._zones)  # type: ignore[return-value]
 
+    def teach_negative(self, index: int, frame: np.ndarray, rectangle: Rectangle) -> None:
+        if index not in (0, 1):
+            raise ValueError("Core type index must be 0 or 1")
+        if rectangle.width < 12 or rectangle.height < 12:
+            raise ValueError("Select a larger false detection area")
+        height, width = frame.shape[:2]
+        if rectangle.x < 0 or rectangle.y < 0 or rectangle.x + rectangle.width > width or rectangle.y + rectangle.height > height:
+            raise ValueError("Selected false detection is outside the camera frame")
+        sample = self._normalize(frame[rectangle.y:rectangle.y + rectangle.height, rectangle.x:rectangle.x + rectangle.width])
+        with self._lock:
+            if self._zones[index] is None:
+                raise ValueError("Teach the PCB core before adding false examples")
+            self._negative_samples[index].append(sample)
+
+    def negative_counts(self) -> tuple[int, int]:
+        with self._lock:
+            return tuple(len(samples) for samples in self._negative_samples)  # type: ignore[return-value]
+
+    def detection_counts(self) -> tuple[int, int]:
+        with self._lock:
+            return self._last_detection_counts
+
     def clear(self) -> None:
         with self._lock:
             self._zones = [None, None]
+            self._negative_samples = [[], []]
+            self._last_detection_counts = (0, 0)
 
     def save(self, path: Path) -> None:
-        """Persist all taught examples locally for the fixed camera/fixture."""
+        """Persist the taught core and its positive/negative examples."""
         with self._lock:
-            if any(zone is None for zone in self._zones):
+            if all(zone is None for zone in self._zones):
                 return
-            zones = [zone for zone in self._zones if zone is not None]
+            zones = list(self._zones)
+            negative_samples = [list(samples) for samples in self._negative_samples]
         arrays: dict[str, np.ndarray] = {}
         for index, zone in enumerate(zones):
+            arrays[f"present_{index}"] = np.array([1 if zone is not None else 0])
+            if zone is None:
+                continue
             arrays[f"guide_{index}"] = np.array([zone.guide.x, zone.guide.y, zone.guide.width, zone.guide.height])
             arrays[f"sample_count_{index}"] = np.array([len(zone.samples)])
             for sample_index, sample in enumerate(zone.samples):
                 arrays[f"template_{index}_{sample_index}"] = sample.template
                 arrays[f"offset_{index}_{sample_index}"] = np.array([sample.target_offset_x, sample.target_offset_y])
+            arrays[f"negative_count_{index}"] = np.array([len(negative_samples[index])])
+            for sample_index, sample in enumerate(negative_samples[index]):
+                arrays[f"negative_{index}_{sample_index}"] = sample
         path.parent.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(path, **arrays)
 
@@ -116,8 +149,14 @@ class PrintZoneAligner:
             return False
         try:
             with np.load(path, allow_pickle=False) as data:
-                zones = []
+                zones: list[LearnedZone | None] = []
+                negative_samples: list[list[np.ndarray]] = []
                 for index in (0, 1):
+                    present_key = f"present_{index}"
+                    if present_key in data and int(data[present_key][0]) == 0:
+                        zones.append(None)
+                        negative_samples.append([])
+                        continue
                     guide = Rectangle(*[int(value) for value in data[f"guide_{index}"]])
                     sample_count_key = f"sample_count_{index}"
                     count = int(data[sample_count_key][0]) if sample_count_key in data else 1
@@ -128,10 +167,14 @@ class PrintZoneAligner:
                         offsets = [int(value) for value in data[offset_key]]
                         samples.append(ZoneSample(data[template_key].copy(), offsets[0], offsets[1]))
                     zones.append(LearnedZone(guide, tuple(samples)))
+                    negative_count_key = f"negative_count_{index}"
+                    negative_count = int(data[negative_count_key][0]) if negative_count_key in data else 0
+                    negative_samples.append([data[f"negative_{index}_{sample_index}"].copy() for sample_index in range(negative_count)])
         except (KeyError, OSError, ValueError):
             return False
         with self._lock:
             self._zones = zones
+            self._negative_samples = negative_samples
         return True
 
     @staticmethod
@@ -142,41 +185,114 @@ class PrintZoneAligner:
     def process(self, frame: np.ndarray) -> tuple[np.ndarray, AlignmentMeasurement | None, str]:
         with self._lock:
             zones = list(self._zones)
+            negative_samples = [list(samples) for samples in self._negative_samples]
         annotated = frame.copy()
-        if any(zone is None for zone in zones):
-            cv2.putText(annotated, "Teach Zone 1 and Zone 2", (12, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-            return annotated, None, "Teach both 11 x 5 mm print targets; surrounding visual context is captured automatically."
+        if zones[0] is None:
+            with self._lock:
+                self._last_detection_counts = (0, 0)
+            cv2.putText(annotated, "Teach a PCB core", (12, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            return annotated, None, "Teach one PCB core example."
 
         gray = self._normalize(frame)
-        candidate_sets: list[list[tuple[Rectangle, float]]] = []
-        guides: list[Rectangle] = []
-        for zone in zones:
-            assert zone is not None
+        detected_by_type: list[list[tuple[Rectangle, float]]] = [[], []]
+        for type_index, zone in enumerate(zones):
+            if zone is None:
+                continue
             candidates: list[tuple[Rectangle, float]] = []
             for sample in zone.samples:
                 result = cv2.matchTemplate(gray, sample.template, cv2.TM_CCOEFF_NORMED)
-                candidates.extend(self._top_candidates(result, sample, zone.guide))
-            candidate_sets.append(candidates)
-            guides.append(zone.guide)
+                candidates.extend(self._top_candidates(result, sample, zone.guide, self._MAX_DETECTIONS_PER_SAMPLE))
+            detected_by_type[type_index] = [
+                candidate
+                for candidate in self._deduplicate_candidates(candidates)
+                if not self._matches_negative(frame, candidate[0], negative_samples[type_index])
+            ]
 
-        matches = self._select_consistent_pair(candidate_sets[0], candidate_sets[1], guides)
-        if matches is None:
-            return annotated, None, "Print-zone matches disagree. Add samples in this lighting/position or reteach the zones."
+        board_detections = detected_by_type[1]
+        core_detections = detected_by_type[0]
+        if zones[1] is not None:
+            core_detections = [
+                detection
+                for detection in core_detections
+                if any(self._contains(board, detection[0].center) for board, _ in board_detections)
+            ]
 
-        for (match, score), zone in zip(matches, zones):
-            assert zone is not None
-            cv2.rectangle(annotated, (zone.guide.x, zone.guide.y), (zone.guide.x + zone.guide.width, zone.guide.y + zone.guide.height), (0, 0, 255), 2)
-            color = (0, 255, 0) if score >= self._MIN_SCORE else (0, 165, 255)
+        board_detections = self._reading_order(board_detections)
+        core_detections = self._reading_order(core_detections)
+
+        for board_number, (board, score) in enumerate(board_detections, start=1):
+            cv2.rectangle(annotated, (board.x, board.y), (board.x + board.width, board.y + board.height), (255, 80, 0), 3)
+            cv2.putText(annotated, f"PCB {board_number}", (board.x, max(18, board.y - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 80, 0), 2)
+
+        if not core_detections:
+            with self._lock:
+                self._last_detection_counts = (len(board_detections), 0)
+            board_status = f" Detected PCBs: {len(board_detections)}." if zones[1] is not None else ""
+            return annotated, None, f"No taught PCB cores detected.{board_status}"
+
+        for core_number, (match, score) in enumerate(core_detections, start=1):
+            color = (0, 255, 0)
             cv2.rectangle(annotated, (match.x, match.y), (match.x + match.width, match.y + match.height), color, 2)
+            cv2.putText(annotated, f"Core {core_number}", (match.x, max(16, match.y - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
-        detected_x = sum(match.center[0] for match, _ in matches) / 2.0
-        detected_y = sum(match.center[1] for match, _ in matches) / 2.0
-        guide_x = sum(guide.center[0] for guide in guides) / 2.0
-        guide_y = sum(guide.center[1] for guide in guides) / 2.0
-        measurement = AlignmentMeasurement(detected_x, detected_y, guide_x - detected_x, guide_y - detected_y, matches[0][1], matches[1][1])
-        cv2.putText(annotated, f"Zone error: X {measurement.error_x:+.1f}px  Y {measurement.error_y:+.1f}px", (12, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
-        counts = "/".join(str(len(zone.samples)) for zone in zones if zone is not None)
-        return annotated, measurement, f"Print zones detected using {counts} saved samples"
+        detected_x = sum(match.center[0] for match, _ in core_detections) / len(core_detections)
+        detected_y = sum(match.center[1] for match, _ in core_detections) / len(core_detections)
+        height, width = frame.shape[:2]
+        measurement = AlignmentMeasurement(
+            detected_x,
+            detected_y,
+            width / 2.0 - detected_x,
+            height / 2.0 - detected_y,
+            max(score for _, score in core_detections),
+            max((score for _, score in board_detections), default=0.0),
+        )
+        cv2.putText(annotated, f"PCBs: {len(board_detections)}  Cores: {len(core_detections)}", (12, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
+        with self._lock:
+            self._last_detection_counts = (len(board_detections), len(core_detections))
+        return annotated, measurement, f"Detected {len(board_detections)} PCBs and {len(core_detections)} cores."
+
+    @staticmethod
+    def _contains(rectangle: Rectangle, point: tuple[float, float]) -> bool:
+        return rectangle.x <= point[0] <= rectangle.x + rectangle.width and rectangle.y <= point[1] <= rectangle.y + rectangle.height
+
+    @staticmethod
+    def _reading_order(detections: list[tuple[Rectangle, float]]) -> list[tuple[Rectangle, float]]:
+        """Number detections top-to-bottom and left-to-right within each visual row."""
+        if not detections:
+            return []
+        typical_height = sorted(rectangle.height for rectangle, _ in detections)[len(detections) // 2]
+        row_height = max(1.0, typical_height * 0.6)
+        return sorted(detections, key=lambda detection: (round(detection[0].center[1] / row_height), detection[0].center[0]))
+
+    def _matches_negative(self, frame: np.ndarray, rectangle: Rectangle, negatives: list[np.ndarray]) -> bool:
+        if not negatives:
+            return False
+        height, width = frame.shape[:2]
+        left, top = max(0, rectangle.x), max(0, rectangle.y)
+        right, bottom = min(width, rectangle.x + rectangle.width), min(height, rectangle.y + rectangle.height)
+        if right <= left or bottom <= top:
+            return True
+        candidate = self._normalize(frame[top:bottom, left:right])
+        for negative in negatives:
+            resized = cv2.resize(candidate, (negative.shape[1], negative.shape[0]))
+            score = float(cv2.matchTemplate(resized, negative, cv2.TM_CCOEFF_NORMED)[0, 0])
+            if score >= 0.72:
+                return True
+        return False
+
+    @staticmethod
+    def _deduplicate_candidates(candidates: list[tuple[Rectangle, float]]) -> list[tuple[Rectangle, float]]:
+        kept: list[tuple[Rectangle, float]] = []
+        for rectangle, score in sorted(candidates, key=lambda candidate: candidate[1], reverse=True):
+            minimum_distance = max(8.0, min(rectangle.width, rectangle.height) * 0.6)
+            if any(
+                (rectangle.center[0] - existing.center[0]) ** 2 + (rectangle.center[1] - existing.center[1]) ** 2
+                < minimum_distance ** 2
+                for existing, _ in kept
+            ):
+                continue
+            kept.append((rectangle, score))
+        return kept
 
     @staticmethod
     def _top_candidates(result: np.ndarray, sample: ZoneSample, guide: Rectangle, count: int = 8) -> list[tuple[Rectangle, float]]:
@@ -190,17 +306,3 @@ class PrintZoneAligner:
             candidates.append((Rectangle(location[0] + sample.target_offset_x, location[1] + sample.target_offset_y, guide.width, guide.height), float(score)))
             cv2.rectangle(working, (max(0, location[0] - suppression), max(0, location[1] - suppression)), (min(working.shape[1] - 1, location[0] + suppression), min(working.shape[0] - 1, location[1] + suppression)), -1.0, -1)
         return candidates
-
-    def _select_consistent_pair(self, first: list[tuple[Rectangle, float]], second: list[tuple[Rectangle, float]], guides: list[Rectangle]) -> list[tuple[Rectangle, float]] | None:
-        best: tuple[float, list[tuple[Rectangle, float]]] | None = None
-        for match_1, score_1 in first:
-            shift_1 = (match_1.x - guides[0].x, match_1.y - guides[0].y)
-            for match_2, score_2 in second:
-                shift_2 = (match_2.x - guides[1].x, match_2.y - guides[1].y)
-                disagreement = float(np.hypot(shift_1[0] - shift_2[0], shift_1[1] - shift_2[1]))
-                if disagreement > self._MAX_PAIR_SHIFT_DIFFERENCE_PX:
-                    continue
-                quality = score_1 + score_2 - disagreement / self._MAX_PAIR_SHIFT_DIFFERENCE_PX
-                if best is None or quality > best[0]:
-                    best = (quality, [(match_1, score_1), (match_2, score_2)])
-        return best[1] if best else None

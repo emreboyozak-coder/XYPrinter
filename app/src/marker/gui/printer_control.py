@@ -1,10 +1,11 @@
-"""Desktop control for motion and two-zone PCB camera alignment."""
+"""Desktop motion control with repeated PCB core detection."""
 
 from __future__ import annotations
 
 import logging
 import sys
 import threading
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -55,6 +56,11 @@ class CameraPreview(QLabel):
         self._selection_enabled = enabled
         self.setCursor(Qt.CrossCursor if enabled else Qt.ArrowCursor)
 
+    def clear_selection(self) -> None:
+        self._drag_start = None
+        self._drag_end = None
+        self.update()
+
     def _visible_rect(self) -> QRect:
         if self._frame_size.isEmpty():
             return QRect()
@@ -94,8 +100,7 @@ class CameraPreview(QLabel):
         if self._drag_start and event.button() == Qt.LeftButton:
             point = self._to_frame_point(event.pos())
             start, end = self._drag_start, point or self._drag_end
-            self._drag_start = None
-            self._drag_end = None
+            self._drag_end = end
             self.set_selection_enabled(False)
             self.update()
             if end:
@@ -149,8 +154,9 @@ class CameraThread(QThread):
 
     frame_ready = pyqtSignal(int, QImage)
     connection_changed = pyqtSignal(int, bool, str)
-    alignment_measurement_changed = pyqtSignal(int, float, float, float, float, float, float)
+    alignment_measurement_changed = pyqtSignal(int, float, float, float, float, float, float, float, float)
     alignment_status_changed = pyqtSignal(int, str)
+    detection_counts_changed = pyqtSignal(int, int, int)
 
     def __init__(self, session: int, ip: str, port: int, template_path: Path) -> None:
         super().__init__()
@@ -175,9 +181,38 @@ class CameraThread(QThread):
         self.aligner.teach(index, frame, rectangle, append=append)
         self.aligner.save(self.template_path)
 
+    def teach_negative(self, index: int, rectangle: Rectangle) -> None:
+        with self._frame_lock:
+            if self._latest_frame is None:
+                raise RuntimeError("No camera frame is available")
+            frame = self._latest_frame.copy()
+        self.aligner.teach_negative(index, frame, rectangle)
+        self.aligner.save(self.template_path)
+
     def clear_zones(self) -> None:
         self.aligner.clear()
         self.template_path.unlink(missing_ok=True)
+
+    def save_latest_frame(self, path: Path, x: float, y: float) -> tuple[int, int]:
+        with self._frame_lock:
+            if self._latest_frame is None:
+                raise RuntimeError("No camera frame is available")
+            raw_frame = self._latest_frame.copy()
+        frame, _, _ = self.aligner.process(raw_frame)
+        counts = self.aligner.detection_counts()
+        cv2.putText(
+            frame,
+            f"Position X={x:.3f} mm  Y={y:.3f} mm",
+            (12, frame.shape[0] - 18),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 255, 255),
+            2,
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not cv2.imwrite(str(path), frame):
+            raise RuntimeError(f"Could not write snapshot: {path}")
+        return counts
 
     def _emit_status(self, status: str) -> None:
         if status != self._last_status:
@@ -205,6 +240,13 @@ class CameraThread(QThread):
                 self._latest_frame = frame.copy()
 
             display_frame, measurement, status = self.aligner.process(frame)
+            pcb_count, core_count = self.aligner.detection_counts()
+            self.detection_counts_changed.emit(self.session, pcb_count, core_count)
+            frame_height, frame_width = display_frame.shape[:2]
+            center_x = frame_width // 2
+            center_y = frame_height // 2
+            cv2.line(display_frame, (0, center_y), (frame_width - 1, center_y), (255, 255, 0), 2)
+            cv2.line(display_frame, (center_x, 0), (center_x, frame_height - 1), (255, 255, 0), 2)
             self._emit_status(status)
             if measurement:
                 self.alignment_measurement_changed.emit(
@@ -215,6 +257,8 @@ class CameraThread(QThread):
                     measurement.error_y,
                     measurement.score_1,
                     measurement.score_2,
+                    float(center_x),
+                    float(center_y),
                 )
 
             rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
@@ -234,6 +278,9 @@ class PCBPrinterGUI(QMainWindow):
     CALIBRATION_DISTANCE_MM = 10.0
     MAX_AUTO_X_STEP_MM = 2.0
     TEMPLATE_PATH = Path(__file__).resolve().parents[4] / "config" / "print-zone-templates.npz"
+    STARTUP_CAPTURE_DIR = Path(__file__).resolve().parents[4] / "snapshots"
+    EXPECTED_PCB_COUNT = 20
+    EXPECTED_CORE_COUNT = 40
 
     def __init__(self) -> None:
         super().__init__()
@@ -250,12 +297,24 @@ class PCBPrinterGUI(QMainWindow):
         self.current_y = 0.0
         self.last_measurement: Optional[AlignmentMeasurement] = None
         self.pixels_per_mm_x: Optional[float] = None
+        self.center_pixels_per_mm_x: Optional[float] = None
+        self.x_axis_camera_response: Optional[tuple[float, float]] = None
+        self.y_axis_camera_response: Optional[tuple[float, float]] = None
+        self.camera_center_x: Optional[float] = None
+        self.camera_center_y: Optional[float] = None
+        self.detected_pcb_count = 0
+        self.detected_core_count = 0
         self._teach_zone_request: Optional[tuple[int, bool]] = None
-        self._pending_calibration: Optional[tuple[float, float]] = None
+        self._reject_core_request: Optional[int] = None
+        self._pending_calibration: Optional[tuple[float, float, float]] = None
+        self._pending_y_calibration: Optional[tuple[float, float, float]] = None
+        self._measurement_serial = 0
+        self._calibration_wait_serial: Optional[int] = None
 
         self._build_ui()
         logging.basicConfig(level=logging.INFO)
         QTimer.singleShot(0, self.connect_camera)
+        QTimer.singleShot(120_000, self.capture_startup_position)
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -263,7 +322,7 @@ class PCBPrinterGUI(QMainWindow):
         layout = QHBoxLayout(central)
 
         camera_layout = QVBoxLayout()
-        camera_group = QGroupBox("DroidCam and Print-Zone Alignment")
+        camera_group = QGroupBox("DroidCam and Multi-Core Detection")
         camera_group_layout = QVBoxLayout(camera_group)
         self.camera_label = CameraPreview()
         self.camera_label.setText("Connecting to DroidCam...")
@@ -289,26 +348,32 @@ class PCBPrinterGUI(QMainWindow):
         self.camera_disconnect_button.clicked.connect(self.disconnect_camera)
         self.camera_disconnect_button.setEnabled(False)
         camera_connection.addWidget(self.camera_disconnect_button, 1, 2, 1, 2)
-        self.teach_zone_1_button = QPushButton("Teach Zone 1")
+        self.teach_zone_1_button = QPushButton("Teach Core")
         self.teach_zone_1_button.clicked.connect(lambda: self.start_teaching_zone(0))
-        camera_connection.addWidget(self.teach_zone_1_button, 2, 0)
-        self.teach_zone_2_button = QPushButton("Teach Zone 2")
-        self.teach_zone_2_button.clicked.connect(lambda: self.start_teaching_zone(1))
-        camera_connection.addWidget(self.teach_zone_2_button, 2, 1)
-        self.clear_zones_button = QPushButton("Clear Zones")
+        camera_connection.addWidget(self.teach_zone_1_button, 2, 0, 1, 2)
+        self.clear_zones_button = QPushButton("Clear Core Learning")
         self.clear_zones_button.clicked.connect(self.clear_zones)
         camera_connection.addWidget(self.clear_zones_button, 2, 2, 1, 2)
-        self.add_zone_1_sample_button = QPushButton("Add Zone 1 Sample")
+        self.add_zone_1_sample_button = QPushButton("Add Core Sample")
         self.add_zone_1_sample_button.clicked.connect(lambda: self.start_teaching_zone(0, append=True))
         camera_connection.addWidget(self.add_zone_1_sample_button, 3, 0, 1, 2)
-        self.add_zone_2_sample_button = QPushButton("Add Zone 2 Sample")
-        self.add_zone_2_sample_button.clicked.connect(lambda: self.start_teaching_zone(1, append=True))
-        camera_connection.addWidget(self.add_zone_2_sample_button, 3, 2, 1, 2)
+        self.reject_type_1_button = QPushButton("Mark False Core")
+        self.reject_type_1_button.clicked.connect(lambda: self.start_rejecting_core(0))
+        camera_connection.addWidget(self.reject_type_1_button, 3, 2, 1, 2)
+        self.teach_pcb_button = QPushButton("Teach PCB")
+        self.teach_pcb_button.clicked.connect(lambda: self.start_teaching_zone(1))
+        camera_connection.addWidget(self.teach_pcb_button, 4, 0)
+        self.add_pcb_sample_button = QPushButton("Add PCB Sample")
+        self.add_pcb_sample_button.clicked.connect(lambda: self.start_teaching_zone(1, append=True))
+        camera_connection.addWidget(self.add_pcb_sample_button, 4, 1)
+        self.reject_pcb_button = QPushButton("Mark False PCB")
+        self.reject_pcb_button.clicked.connect(lambda: self.start_rejecting_core(1))
+        camera_connection.addWidget(self.reject_pcb_button, 4, 2, 1, 2)
         camera_group_layout.addLayout(camera_connection)
-        self.sample_library_label = QLabel("Sample library: Zone 1 = 0, Zone 2 = 0. Add as many samples as needed.")
+        self.sample_library_label = QLabel("Samples: Core = 0, PCB = 0, false core = 0, false PCB = 0.")
         self.sample_library_label.setWordWrap(True)
         camera_group_layout.addWidget(self.sample_library_label)
-        self.alignment_label = QLabel("Teach both 11 x 5 mm print targets; matching context is captured automatically.")
+        self.alignment_label = QLabel("Teach one PCB core example to detect all matching cores.")
         self.alignment_label.setWordWrap(True)
         camera_group_layout.addWidget(self.alignment_label)
         camera_layout.addWidget(camera_group)
@@ -319,7 +384,7 @@ class PCBPrinterGUI(QMainWindow):
         controls.addWidget(self._build_position_group())
         controls.addWidget(self._build_move_group())
 
-        alignment_group = QGroupBox("X Alignment")
+        alignment_group = QGroupBox("Camera Alignment")
         alignment_layout = QVBoxLayout(alignment_group)
         self.calibrate_x_button = QPushButton("Calibrate X (+10 mm)")
         self.calibrate_x_button.clicked.connect(self.calibrate_x)
@@ -331,6 +396,20 @@ class PCBPrinterGUI(QMainWindow):
         alignment_layout.addWidget(self.align_x_button)
         self.x_calibration_label = QLabel("X calibration: required")
         alignment_layout.addWidget(self.x_calibration_label)
+        self.calibrate_y_button = QPushButton("Calibrate Y (+10 mm)")
+        self.calibrate_y_button.clicked.connect(self.calibrate_y)
+        self.calibrate_y_button.setEnabled(False)
+        alignment_layout.addWidget(self.calibrate_y_button)
+        self.y_calibration_label = QLabel("Y calibration: required")
+        alignment_layout.addWidget(self.y_calibration_label)
+        self.center_x_button = QPushButton("Center X on Camera")
+        self.center_x_button.clicked.connect(self.center_x_on_camera)
+        self.center_x_button.setEnabled(False)
+        alignment_layout.addWidget(self.center_x_button)
+        self.center_y_button = QPushButton("Center Y on Camera")
+        self.center_y_button.clicked.connect(self.center_y_on_camera)
+        self.center_y_button.setEnabled(False)
+        alignment_layout.addWidget(self.center_y_button)
         controls.addWidget(alignment_group)
 
         self.status_label = QLabel("Select the controller port and connect.")
@@ -450,6 +529,16 @@ class PCBPrinterGUI(QMainWindow):
         can_align = self.is_connected and not moving and self.last_measurement is not None
         self.calibrate_x_button.setEnabled(can_align)
         self.align_x_button.setEnabled(can_align and self.pixels_per_mm_x is not None)
+        self.calibrate_y_button.setEnabled(can_align)
+        can_center = (
+            can_align
+            and self.x_axis_camera_response is not None
+            and self.y_axis_camera_response is not None
+            and self.camera_center_x is not None
+            and self.camera_center_y is not None
+        )
+        self.center_x_button.setEnabled(can_center)
+        self.center_y_button.setEnabled(can_center)
 
     def connect_camera(self) -> None:
         self.disconnect_camera()
@@ -466,10 +555,11 @@ class PCBPrinterGUI(QMainWindow):
         self.camera_thread.connection_changed.connect(self.on_camera_connection_changed)
         self.camera_thread.alignment_measurement_changed.connect(self.on_alignment_measurement)
         self.camera_thread.alignment_status_changed.connect(self.on_alignment_status)
+        self.camera_thread.detection_counts_changed.connect(self.on_detection_counts)
         self.camera_thread.finished.connect(lambda thread=self.camera_thread: self.on_camera_thread_finished(thread))
         self.camera_thread.start()
         if self.camera_thread.loaded_saved_zones:
-            self.alignment_label.setText("Saved print zones loaded. Confirm the red and green rectangles match the board.")
+            self.alignment_label.setText("Saved PCB/core samples loaded. PCBs are blue; cores are green.")
         self.update_sample_library_label()
 
     def disconnect_camera(self) -> None:
@@ -491,6 +581,43 @@ class PCBPrinterGUI(QMainWindow):
             return
         self.camera_label.show_image(image)
 
+    def capture_startup_position(self) -> None:
+        if not self.camera_thread or not self.camera_thread.isRunning():
+            message = "The 2-minute startup capture failed because the camera is not connected."
+            self.status_label.setText(message)
+            QMessageBox.warning(self, "Startup Capture", message)
+            return
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"startup_{timestamp}_X{self.current_x:+.3f}_Y{self.current_y:+.3f}.jpg"
+        path = self.STARTUP_CAPTURE_DIR / filename
+        try:
+            pcb_count, core_count = self.camera_thread.save_latest_frame(path, self.current_x, self.current_y)
+        except Exception as exc:
+            message = f"The 2-minute startup capture failed: {exc}"
+            self.status_label.setText(message)
+            QMessageBox.warning(self, "Startup Capture", message)
+            return
+        message = (
+            f"Startup position photo saved at X={self.current_x:.3f} mm, Y={self.current_y:.3f} mm.\n"
+            f"Detected: {pcb_count} PCBs and {core_count} cores.\n{path}"
+        )
+        self.status_label.setText(message)
+        if pcb_count == self.EXPECTED_PCB_COUNT and core_count == self.EXPECTED_CORE_COUNT:
+            QMessageBox.information(self, "Startup Capture Complete", message + "\nCounts are correct.")
+        else:
+            QMessageBox.warning(
+                self,
+                "Startup Count Warning",
+                message
+                + f"\nExpected: {self.EXPECTED_PCB_COUNT} PCBs and {self.EXPECTED_CORE_COUNT} cores.",
+            )
+
+    def on_detection_counts(self, session: int, pcb_count: int, core_count: int) -> None:
+        if session != self._camera_session:
+            return
+        self.detected_pcb_count = pcb_count
+        self.detected_core_count = core_count
+
     def on_camera_connection_changed(self, session: int, connected: bool, message: str) -> None:
         if session != self._camera_session:
             return
@@ -504,44 +631,105 @@ class PCBPrinterGUI(QMainWindow):
 
     def start_teaching_zone(self, index: int, append: bool = False) -> None:
         if not self.camera_thread or not self.camera_thread.isRunning():
-            self.status_label.setText("Connect the camera before teaching a print zone.")
+            self.status_label.setText("Connect the camera before teaching a PCB core.")
             return
         self._teach_zone_request = (index, append)
+        self._reject_core_request = None
         self.camera_label.set_selection_enabled(True)
-        action = "Add a new example for" if append else "Set the red target for"
-        self.status_label.setText(f"{action} 11 x 5 mm print zone {index + 1}; context is added automatically.")
+        action = "Add a new example for" if append else "Teach"
+        target = "PCB core" if index == 0 else "complete PCB board"
+        self.status_label.setText(f"{action} {target}; draw a tight rectangle around it.")
+
+    def start_rejecting_core(self, index: int) -> None:
+        if not self.camera_thread or not self.camera_thread.isRunning():
+            self.status_label.setText("Connect the camera before marking a false detection.")
+            return
+        if self.camera_thread.aligner.sample_counts()[index] == 0:
+            target = "core" if index == 0 else "PCB"
+            self.status_label.setText(f"Teach the {target} before adding false examples.")
+            return
+        self._teach_zone_request = None
+        self._reject_core_request = index
+        self.camera_label.set_selection_enabled(True)
+        target = "core" if index == 0 else "PCB"
+        self.status_label.setText(f"Draw a tight rectangle around one false {target} detection.")
 
     def on_zone_selected(self, x: int, y: int, width: int, height: int) -> None:
-        if self._teach_zone_request is None or not self.camera_thread:
+        if not self.camera_thread:
+            return
+        if self._reject_core_request is not None:
+            index = self._reject_core_request
+            try:
+                answer = QMessageBox.question(
+                    self,
+                    "Confirm False Detection",
+                    "Mark this frame as NOT a core?" if index == 0 else "Mark this frame as NOT a PCB?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                )
+                if answer == QMessageBox.Yes:
+                    self.camera_thread.teach_negative(index, Rectangle(x, y, width, height))
+                    target = "core" if index == 0 else "PCB"
+                    self.status_label.setText(f"False {target} example saved and will be rejected.")
+                    self.update_sample_library_label()
+                else:
+                    self.status_label.setText("False-detection example was not saved.")
+            except Exception as exc:
+                self.status_label.setText(f"Could not save false detection: {exc}")
+            finally:
+                self._reject_core_request = None
+                self.camera_label.clear_selection()
+            return
+        if self._teach_zone_request is None:
             return
         index, append = self._teach_zone_request
         try:
+            answer = QMessageBox.question(
+                self,
+                "Confirm Frame",
+                "Accept this PCB core sample?" if index == 0 else "Accept this complete PCB sample?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                target = "Core" if index == 0 else "PCB"
+                self.status_label.setText(f"{target} sample was not saved. Select it again when ready.")
+                return
             self.camera_thread.teach_zone(index, Rectangle(x, y, width, height), append)
             count_1, count_2 = self.camera_thread.aligner.sample_counts()
-            self.status_label.setText(f"Zone {index + 1} saved. Samples: Zone 1 = {count_1}, Zone 2 = {count_2}.")
+            target = "Core" if index == 0 else "PCB"
+            self.status_label.setText(f"{target} saved. Samples: Core = {count_1}, PCB = {count_2}.")
             self.update_sample_library_label()
         except Exception as exc:
-            self.status_label.setText(f"Could not teach zone: {exc}")
+            self.status_label.setText(f"Could not teach PCB core: {exc}")
         finally:
             self._teach_zone_request = None
+            self.camera_label.clear_selection()
 
     def clear_zones(self) -> None:
         if self.camera_thread:
             self.camera_thread.clear_zones()
         self.last_measurement = None
         self.pixels_per_mm_x = None
+        self.center_pixels_per_mm_x = None
+        self.x_axis_camera_response = None
+        self.y_axis_camera_response = None
+        self.camera_center_x = None
+        self.camera_center_y = None
         self.x_calibration_label.setText("X calibration: required")
-        self.alignment_label.setText("Teach both 11 x 5 mm print targets; matching context is captured automatically.")
+        self.y_calibration_label.setText("Y calibration: required")
+        self.alignment_label.setText("Teach one PCB core example to detect all matching cores.")
         self.update_sample_library_label()
         self._update_motion_ui()
 
     def update_sample_library_label(self) -> None:
         if not self.camera_thread:
-            self.sample_library_label.setText("Sample library: camera is disconnected.")
+            self.sample_library_label.setText("Core sample library: camera is disconnected.")
             return
         count_1, count_2 = self.camera_thread.aligner.sample_counts()
+        negative_1, negative_2 = self.camera_thread.aligner.negative_counts()
         self.sample_library_label.setText(
-            f"Sample library: Zone 1 = {count_1}, Zone 2 = {count_2}. Add as many samples as needed."
+            f"Samples: Core = {count_1}, PCB = {count_2}, false core = {negative_1}, false PCB = {negative_2}."
         )
 
     def on_alignment_status(self, session: int, message: str) -> None:
@@ -549,10 +737,13 @@ class PCBPrinterGUI(QMainWindow):
             return
         self.alignment_label.setText(message)
 
-    def on_alignment_measurement(self, session: int, midpoint_x: float, midpoint_y: float, error_x: float, error_y: float, score_1: float, score_2: float) -> None:
+    def on_alignment_measurement(self, session: int, midpoint_x: float, midpoint_y: float, error_x: float, error_y: float, score_1: float, score_2: float, center_x: float, center_y: float) -> None:
         if session != self._camera_session:
             return
+        self._measurement_serial += 1
         self.last_measurement = AlignmentMeasurement(midpoint_x, midpoint_y, error_x, error_y, score_1, score_2)
+        self.camera_center_x = center_x
+        self.camera_center_y = center_y
         self.alignment_label.setText(
             f"Detected. X error: {error_x:+.1f} px, Y error: {error_y:+.1f} px. "
             f"Scores: {score_1:.2f}, {score_2:.2f}."
@@ -578,37 +769,67 @@ class PCBPrinterGUI(QMainWindow):
         self._set_position_labels()
         self._update_motion_ui()
         if self._pending_calibration:
-            self.status_label.setText("Calibration move complete. Reading camera alignment...")
-            QTimer.singleShot(1000, self.finish_x_calibration)
+            self._calibration_wait_serial = self._measurement_serial
+            self.status_label.setText("Calibration move complete. Waiting 5 seconds for an updated camera frame...")
+            QTimer.singleShot(5000, self.finish_x_calibration)
+        elif self._pending_y_calibration:
+            self._calibration_wait_serial = self._measurement_serial
+            self.status_label.setText("Y calibration move complete. Waiting 5 seconds for an updated camera frame...")
+            QTimer.singleShot(5000, self.finish_y_calibration)
         else:
             self.status_label.setText("Move complete")
 
     def on_motion_error(self, error: str) -> None:
         self._pending_calibration = None
+        self._pending_y_calibration = None
+        self._calibration_wait_serial = None
         self.status_label.setText(f"Move failed: {error}")
         self._update_motion_ui()
 
     def calibrate_x(self) -> None:
         if not self.last_measurement:
             return
-        self._pending_calibration = (self.last_measurement.midpoint_x, self.CALIBRATION_DISTANCE_MM)
+        self.x_axis_camera_response = None
+        self._pending_calibration = (
+            self.last_measurement.midpoint_x,
+            self.last_measurement.midpoint_y,
+            self.CALIBRATION_DISTANCE_MM,
+        )
         self._start_move(self.current_x + self.CALIBRATION_DISTANCE_MM, self.current_y, "Calibrating X")
 
     def finish_x_calibration(self) -> None:
         if not self._pending_calibration:
             return
-        start_x, distance_mm = self._pending_calibration
+        if self._calibration_wait_serial is not None and self._measurement_serial <= self._calibration_wait_serial:
+            self.status_label.setText("Still waiting for a new camera frame after the X calibration move...")
+            QTimer.singleShot(1000, self.finish_x_calibration)
+            return
+        start_x, start_y, distance_mm = self._pending_calibration
         self._pending_calibration = None
+        self._calibration_wait_serial = None
         if not self.last_measurement:
             self.status_label.setText("Calibration failed: no current print-zone detection.")
             return
-        pixel_shift = self.last_measurement.midpoint_x - start_x
-        if abs(pixel_shift) < 5.0:
-            self.status_label.setText("Calibration failed: camera saw too little X movement.")
+        horizontal_pixel_shift = self.last_measurement.midpoint_x - start_x
+        vertical_pixel_shift = self.last_measurement.midpoint_y - start_y
+        if abs(horizontal_pixel_shift) < 5.0 and abs(vertical_pixel_shift) < 5.0:
+            self.status_label.setText("Calibration failed: camera saw too little movement from the X axis.")
             return
-        self.pixels_per_mm_x = pixel_shift / distance_mm
-        self.x_calibration_label.setText(f"X calibration: {self.pixels_per_mm_x:.2f} px/mm")
-        self.status_label.setText("X calibration complete. Use Align X for bounded corrections.")
+        self.pixels_per_mm_x = horizontal_pixel_shift / distance_mm if abs(horizontal_pixel_shift) >= 5.0 else None
+        self.center_pixels_per_mm_x = vertical_pixel_shift / distance_mm if abs(vertical_pixel_shift) >= 5.0 else None
+        self.x_axis_camera_response = (horizontal_pixel_shift / distance_mm, vertical_pixel_shift / distance_mm)
+        horizontal_status = (
+            f"{self.pixels_per_mm_x:.2f} horizontal px/mm"
+            if self.pixels_per_mm_x is not None
+            else "horizontal response unavailable"
+        )
+        center_status = (
+            f", center {self.center_pixels_per_mm_x:.2f} vertical px/mm"
+            if self.center_pixels_per_mm_x is not None
+            else ", center-line response unavailable"
+        )
+        self.x_calibration_label.setText(f"X calibration: {horizontal_status}{center_status}")
+        self.status_label.setText("X calibration complete. Calibrate Y to enable full camera centering.")
         self._update_motion_ui()
 
     def align_x(self) -> None:
@@ -620,6 +841,83 @@ class PCBPrinterGUI(QMainWindow):
             return
         correction_mm = max(-self.MAX_AUTO_X_STEP_MM, min(self.MAX_AUTO_X_STEP_MM, correction_mm))
         self._start_move(self.current_x + correction_mm, self.current_y, "Aligning X")
+
+    def calibrate_y(self) -> None:
+        if not self.last_measurement:
+            return
+        self.y_axis_camera_response = None
+        self._pending_y_calibration = (
+            self.last_measurement.midpoint_x,
+            self.last_measurement.midpoint_y,
+            self.CALIBRATION_DISTANCE_MM,
+        )
+        self._start_move(self.current_x, self.current_y + self.CALIBRATION_DISTANCE_MM, "Calibrating Y")
+
+    def finish_y_calibration(self) -> None:
+        if not self._pending_y_calibration:
+            return
+        if self._calibration_wait_serial is not None and self._measurement_serial <= self._calibration_wait_serial:
+            self.status_label.setText("Still waiting for a new camera frame after the Y calibration move...")
+            QTimer.singleShot(1000, self.finish_y_calibration)
+            return
+        start_x, start_y, distance_mm = self._pending_y_calibration
+        self._pending_y_calibration = None
+        self._calibration_wait_serial = None
+        if not self.last_measurement:
+            self.status_label.setText("Y calibration failed: no current frame detection.")
+            return
+        horizontal_shift = self.last_measurement.midpoint_x - start_x
+        vertical_shift = self.last_measurement.midpoint_y - start_y
+        if abs(horizontal_shift) < 5.0 and abs(vertical_shift) < 5.0:
+            self.status_label.setText("Y calibration failed: camera saw too little movement from the Y axis.")
+            return
+        self.y_axis_camera_response = (horizontal_shift / distance_mm, vertical_shift / distance_mm)
+        self.y_calibration_label.setText(
+            f"Y calibration: X {self.y_axis_camera_response[0]:.2f}, Y {self.y_axis_camera_response[1]:.2f} px/mm"
+        )
+        self.status_label.setText("Y calibration complete. Full camera centering is ready.")
+        self._update_motion_ui()
+
+    def _camera_center_corrections(self) -> Optional[tuple[float, float]]:
+        if (
+            not self.last_measurement
+            or self.x_axis_camera_response is None
+            or self.y_axis_camera_response is None
+            or self.camera_center_x is None
+            or self.camera_center_y is None
+        ):
+            return
+        error_x = self.camera_center_x - self.last_measurement.midpoint_x
+        error_y = self.camera_center_y - self.last_measurement.midpoint_y
+        x_dx, x_dy = self.x_axis_camera_response
+        y_dx, y_dy = self.y_axis_camera_response
+        determinant = x_dx * y_dy - y_dx * x_dy
+        if abs(determinant) < 0.01:
+            self.status_label.setText("Centering failed: X/Y camera calibration directions are too similar.")
+            return None
+        correction_x = (error_x * y_dy - y_dx * error_y) / determinant
+        correction_y = (x_dx * error_y - error_x * x_dy) / determinant
+        return correction_x, correction_y
+
+    def center_x_on_camera(self) -> None:
+        corrections = self._camera_center_corrections()
+        if corrections is None:
+            return
+        correction_x, _ = corrections
+        if abs(correction_x) < 0.05:
+            self.status_label.setText("X is already centered within 0.05 mm.")
+            return
+        self._start_move(self.current_x + correction_x, self.current_y, "Centering X on camera")
+
+    def center_y_on_camera(self) -> None:
+        corrections = self._camera_center_corrections()
+        if corrections is None:
+            return
+        _, correction_y = corrections
+        if abs(correction_y) < 0.05:
+            self.status_label.setText("Y is already centered within 0.05 mm.")
+            return
+        self._start_move(self.current_x, self.current_y + correction_y, "Centering Y on camera")
 
     def _set_position_labels(self) -> None:
         self.x_position_label.setText(f"{self.current_x:.3f} mm")
