@@ -206,7 +206,7 @@ class CameraThread(QThread):
         self.aligner.clear()
         self.template_path.unlink(missing_ok=True)
 
-    def save_latest_frame(self, path: Path, x: float, y: float) -> tuple[int, int, Optional[float], Optional[float]]:
+    def save_latest_frame(self, path: Path, x: float, y: float) -> tuple[int, int, Optional[float], Optional[float], list[tuple[int, int, float, float]]]:
         with self._frame_lock:
             if self._latest_frame is None:
                 raise RuntimeError("No camera frame is available")
@@ -227,7 +227,7 @@ class CameraThread(QThread):
             raise RuntimeError(f"Could not write snapshot: {path}")
         primary_x = measurement.primary_x if measurement is not None else None
         primary_y = measurement.primary_y if measurement is not None else None
-        return counts[0], counts[1], primary_x, primary_y
+        return counts[0], counts[1], primary_x, primary_y, self.aligner.numbered_core_centers()
 
     def _emit_status(self, status: str) -> None:
         if status != self._last_status:
@@ -354,6 +354,10 @@ class PCBPrinterGUI(QMainWindow):
         self._full_layout_capture_saved = False
         self._reference_primary_core: Optional[tuple[float, float]] = None
         self._reference_machine_position: Optional[tuple[float, float]] = None
+        self._reference_core_targets: list[tuple[int, int, float, float]] = []
+        self._current_core_target_index = 0
+        self._core_navigation_ready = False
+        self._navigation_target_label: Optional[str] = None
         self._auto_center_phase: Optional[str] = None
         self._auto_center_y_correction: Optional[float] = None
         self._teach_zone_request: Optional[tuple[int, bool]] = None
@@ -463,6 +467,10 @@ class PCBPrinterGUI(QMainWindow):
         self.center_y_button.clicked.connect(self.center_y_on_camera)
         self.center_y_button.setEnabled(False)
         alignment_layout.addWidget(self.center_y_button)
+        self.next_core_button = QPushButton("Next Core")
+        self.next_core_button.clicked.connect(self.go_to_next_core)
+        self.next_core_button.setEnabled(False)
+        alignment_layout.addWidget(self.next_core_button)
         controls.addWidget(alignment_group)
 
         self.status_label = QLabel("Select the controller port and connect.")
@@ -592,6 +600,7 @@ class PCBPrinterGUI(QMainWindow):
         )
         self.center_x_button.setEnabled(can_center)
         self.center_y_button.setEnabled(can_center)
+        self.next_core_button.setEnabled(can_center and self._core_navigation_ready and bool(self._reference_core_targets))
 
     def connect_camera(self) -> None:
         self.disconnect_camera()
@@ -644,7 +653,7 @@ class PCBPrinterGUI(QMainWindow):
         filename = f"startup_{timestamp}_X{self.current_x:+.3f}_Y{self.current_y:+.3f}.jpg"
         path = self.STARTUP_CAPTURE_DIR / filename
         try:
-            pcb_count, core_count, primary_x, primary_y = self.camera_thread.save_latest_frame(path, self.current_x, self.current_y)
+            pcb_count, core_count, primary_x, primary_y, core_targets = self.camera_thread.save_latest_frame(path, self.current_x, self.current_y)
         except Exception as exc:
             message = f"The 30-second startup capture failed: {exc}"
             self.status_label.setText(message)
@@ -659,6 +668,9 @@ class PCBPrinterGUI(QMainWindow):
             if primary_x is not None and primary_y is not None:
                 self._reference_primary_core = (primary_x, primary_y)
                 self._reference_machine_position = (self.current_x, self.current_y)
+                self._reference_core_targets = core_targets
+                self._current_core_target_index = 0
+                self._core_navigation_ready = False
             QMessageBox.information(self, "Startup Capture Complete", message + "\nCounts are correct.")
         else:
             QMessageBox.warning(
@@ -688,7 +700,7 @@ class PCBPrinterGUI(QMainWindow):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         path = self.STARTUP_CAPTURE_DIR / f"all_pcbs_cores_{timestamp}.jpg"
         try:
-            pcb_count, core_count, primary_x, primary_y = self.camera_thread.save_latest_frame(path, self.current_x, self.current_y)
+            pcb_count, core_count, primary_x, primary_y, core_targets = self.camera_thread.save_latest_frame(path, self.current_x, self.current_y)
         except Exception as exc:
             self._full_layout_capture_saved = False
             self.status_label.setText(f"Could not save the complete PCB/core photo: {exc}")
@@ -701,6 +713,9 @@ class PCBPrinterGUI(QMainWindow):
             return
         self._reference_primary_core = (primary_x, primary_y)
         self._reference_machine_position = (self.current_x, self.current_y)
+        self._reference_core_targets = core_targets
+        self._current_core_target_index = 0
+        self._core_navigation_ready = False
         message = f"All {pcb_count} PCBs and {core_count} cores were detected and saved.\n{path}"
         self.status_label.setText(message)
         QMessageBox.information(self, "Complete PCB/Core Capture", message)
@@ -803,6 +818,11 @@ class PCBPrinterGUI(QMainWindow):
         self.y_axis_camera_response = None
         self.camera_center_x = None
         self.camera_center_y = None
+        self._reference_primary_core = None
+        self._reference_machine_position = None
+        self._reference_core_targets = []
+        self._core_navigation_ready = False
+        self._navigation_target_label = None
         self.x_calibration_label.setText("X calibration: required")
         self.y_calibration_label.setText("Y calibration: required")
         self.alignment_label.setText("Teach one PCB core example to detect all matching cores.")
@@ -870,9 +890,17 @@ class PCBPrinterGUI(QMainWindow):
         elif self._auto_center_phase == "y":
             self._auto_center_phase = None
             self._auto_center_y_correction = None
+            self._current_core_target_index = 0
+            self._core_navigation_ready = True
             message = "PCB 1 Core 1 automatic X/Y centering is complete."
             self.status_label.setText(message)
+            self._update_motion_ui()
             QMessageBox.information(self, "Automatic Centering Complete", message)
+        elif self._navigation_target_label is not None:
+            message = f"Reached {self._navigation_target_label}."
+            self._navigation_target_label = None
+            self.status_label.setText(message)
+            self._update_motion_ui()
         else:
             self.status_label.setText("Move complete")
 
@@ -883,6 +911,7 @@ class PCBPrinterGUI(QMainWindow):
         self._pending_calibration_frame = None
         self._auto_center_phase = None
         self._auto_center_y_correction = None
+        self._navigation_target_label = None
         self.status_label.setText(f"Move failed: {error}")
         self._update_motion_ui()
 
@@ -1093,8 +1122,11 @@ class PCBPrinterGUI(QMainWindow):
         if abs(target_y - self.current_y) < 0.05:
             self._auto_center_phase = None
             self._auto_center_y_correction = None
+            self._current_core_target_index = 0
+            self._core_navigation_ready = True
             message = "PCB 1 Core 1 is already centered on Y; automatic centering is complete."
             self.status_label.setText(message)
+            self._update_motion_ui()
             QMessageBox.information(self, "Automatic Centering Complete", message)
             return
         self._auto_center_phase = "y"
@@ -1142,6 +1174,26 @@ class PCBPrinterGUI(QMainWindow):
             self.status_label.setText("Y is already centered within 0.05 mm.")
             return
         self._start_move(self.current_x, self.current_y + correction_y, "Centering Y on camera")
+
+    def go_to_next_core(self) -> None:
+        if (
+            not self._core_navigation_ready
+            or not self._reference_core_targets
+            or self._reference_machine_position is None
+        ):
+            return
+        next_index = (self._current_core_target_index + 1) % len(self._reference_core_targets)
+        pcb_number, core_number, pixel_x, pixel_y = self._reference_core_targets[next_index]
+        corrections = self._camera_center_corrections((pixel_x, pixel_y))
+        if corrections is None:
+            self.status_label.setText(f"Could not calculate the target for PCB {pcb_number} Core {core_number}.")
+            return
+        correction_x, correction_y = corrections
+        target_x = self._reference_machine_position[0] + correction_x
+        target_y = self._reference_machine_position[1] + correction_y
+        self._current_core_target_index = next_index
+        self._navigation_target_label = f"PCB {pcb_number} Core {core_number}"
+        self._start_move(target_x, target_y, f"Moving to {self._navigation_target_label}")
 
     def _set_position_labels(self) -> None:
         self.x_position_label.setText(f"{self.current_x:.3f} mm")

@@ -63,6 +63,7 @@ class PrintZoneAligner:
         self._zones: list[LearnedZone | None] = [None, None]
         self._negative_samples: list[list[np.ndarray]] = [[], []]
         self._last_detection_counts = (0, 0)
+        self._last_numbered_core_centers: list[tuple[int, int, float, float]] = []
 
     def teach(self, index: int, frame: np.ndarray, rectangle: Rectangle, *, append: bool = False) -> None:
         if index not in (0, 1):
@@ -116,11 +117,16 @@ class PrintZoneAligner:
         with self._lock:
             return self._last_detection_counts
 
+    def numbered_core_centers(self) -> list[tuple[int, int, float, float]]:
+        with self._lock:
+            return list(self._last_numbered_core_centers)
+
     def clear(self) -> None:
         with self._lock:
             self._zones = [None, None]
             self._negative_samples = [[], []]
             self._last_detection_counts = (0, 0)
+            self._last_numbered_core_centers = []
 
     def save(self, path: Path) -> None:
         """Persist the taught core and its positive/negative examples."""
@@ -192,6 +198,7 @@ class PrintZoneAligner:
         if zones[0] is None:
             with self._lock:
                 self._last_detection_counts = (0, 0)
+                self._last_numbered_core_centers = []
             cv2.putText(annotated, "Teach a PCB core", (12, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
             return annotated, None, "Teach one PCB core example."
 
@@ -237,6 +244,7 @@ class PrintZoneAligner:
         if not numbered_cores:
             with self._lock:
                 self._last_detection_counts = (len(board_detections), 0)
+                self._last_numbered_core_centers = []
             board_status = f" Detected PCBs: {len(board_detections)}." if zones[1] is not None else ""
             return annotated, None, f"No taught PCB cores detected.{board_status}"
 
@@ -288,6 +296,10 @@ class PrintZoneAligner:
         cv2.putText(annotated, f"PCBs: {len(board_detections)}  Cores: {detected_core_count}  Incomplete: {incomplete_boards}", (12, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
         with self._lock:
             self._last_detection_counts = (len(board_detections), detected_core_count)
+            self._last_numbered_core_centers = [
+                (pcb_number, core_number, match.center[0], match.center[1])
+                for pcb_number, core_number, match, _ in numbered_cores
+            ]
         return annotated, measurement, f"Detected {len(board_detections)} PCBs and {detected_core_count} cores; visual tracking reference is PCB {calibration_board_number} Core 1; {incomplete_boards} PCBs are incomplete."
 
     @staticmethod
