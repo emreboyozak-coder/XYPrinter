@@ -128,6 +128,15 @@ class PrintZoneAligner:
             self._last_detection_counts = (0, 0)
             self._last_numbered_core_centers = []
 
+    def clear_type(self, index: int) -> None:
+        if index not in (0, 1):
+            raise ValueError("Learning type index must be 0 or 1")
+        with self._lock:
+            self._zones[index] = None
+            self._negative_samples[index] = []
+            self._last_detection_counts = (0, 0)
+            self._last_numbered_core_centers = []
+
     def save(self, path: Path) -> None:
         """Persist the taught core and its positive/negative examples."""
         with self._lock:

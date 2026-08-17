@@ -113,3 +113,16 @@ def test_false_detection_examples_are_persisted(tmp_path) -> None:
     reloaded = PrintZoneAligner()
     assert reloaded.load(path) is True
     assert reloaded.negative_counts() == (1, 0)
+
+
+def test_core_and_pcb_learning_can_be_cleared_independently() -> None:
+    reference = _reference_frame()
+    aligner = PrintZoneAligner()
+    aligner.teach(0, reference, Rectangle(80, 100, 66, 51))
+    aligner.teach(1, reference, Rectangle(40, 60, 300, 130))
+
+    aligner.clear_type(1)
+    assert aligner.sample_counts() == (1, 0)
+
+    aligner.clear_type(0)
+    assert aligner.sample_counts() == (0, 0)

@@ -206,6 +206,13 @@ class CameraThread(QThread):
         self.aligner.clear()
         self.template_path.unlink(missing_ok=True)
 
+    def clear_learning_type(self, index: int) -> None:
+        self.aligner.clear_type(index)
+        if self.aligner.sample_counts() == (0, 0):
+            self.template_path.unlink(missing_ok=True)
+        else:
+            self.aligner.save(self.template_path)
+
     def save_latest_frame(self, path: Path, x: float, y: float) -> tuple[int, int, Optional[float], Optional[float], list[tuple[int, int, float, float]]]:
         with self._frame_lock:
             if self._latest_frame is None:
@@ -409,7 +416,7 @@ class PCBPrinterGUI(QMainWindow):
         self.teach_zone_1_button.clicked.connect(lambda: self.start_teaching_zone(0))
         camera_connection.addWidget(self.teach_zone_1_button, 2, 0, 1, 2)
         self.clear_zones_button = QPushButton("Clear Core Learning")
-        self.clear_zones_button.clicked.connect(self.clear_zones)
+        self.clear_zones_button.clicked.connect(lambda: self.clear_learning_type(0))
         camera_connection.addWidget(self.clear_zones_button, 2, 2, 1, 2)
         self.add_zone_1_sample_button = QPushButton("Add Core Sample")
         self.add_zone_1_sample_button.clicked.connect(lambda: self.start_teaching_zone(0, append=True))
@@ -426,6 +433,9 @@ class PCBPrinterGUI(QMainWindow):
         self.reject_pcb_button = QPushButton("Mark False PCB")
         self.reject_pcb_button.clicked.connect(lambda: self.start_rejecting_core(1))
         camera_connection.addWidget(self.reject_pcb_button, 4, 2, 1, 2)
+        self.clear_pcb_button = QPushButton("Clear PCB Learning")
+        self.clear_pcb_button.clicked.connect(lambda: self.clear_learning_type(1))
+        camera_connection.addWidget(self.clear_pcb_button, 5, 0, 1, 4)
         camera_group_layout.addLayout(camera_connection)
         self.sample_library_label = QLabel("Samples: Core = 0, PCB = 0, false core = 0, false PCB = 0.")
         self.sample_library_label.setWordWrap(True)
@@ -808,9 +818,9 @@ class PCBPrinterGUI(QMainWindow):
             self._teach_zone_request = None
             self.camera_label.clear_selection()
 
-    def clear_zones(self) -> None:
+    def clear_learning_type(self, index: int) -> None:
         if self.camera_thread:
-            self.camera_thread.clear_zones()
+            self.camera_thread.clear_learning_type(index)
         self.last_measurement = None
         self.pixels_per_mm_x = None
         self.center_pixels_per_mm_x = None
@@ -825,7 +835,8 @@ class PCBPrinterGUI(QMainWindow):
         self._navigation_target_label = None
         self.x_calibration_label.setText("X calibration: required")
         self.y_calibration_label.setText("Y calibration: required")
-        self.alignment_label.setText("Teach one PCB core example to detect all matching cores.")
+        target = "Core" if index == 0 else "PCB"
+        self.alignment_label.setText(f"{target} learning cleared.")
         self.update_sample_library_label()
         self._update_motion_ui()
 
