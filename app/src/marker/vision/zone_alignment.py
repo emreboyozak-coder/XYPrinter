@@ -199,7 +199,11 @@ class PrintZoneAligner:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         return cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
 
-    def process(self, frame: np.ndarray) -> tuple[np.ndarray, AlignmentMeasurement | None, str]:
+    def process(
+        self,
+        frame: np.ndarray,
+        search_region: Rectangle | None = None,
+    ) -> tuple[np.ndarray, AlignmentMeasurement | None, str]:
         with self._lock:
             zones = list(self._zones)
             negative_samples = [list(samples) for samples in self._negative_samples]
@@ -211,15 +215,39 @@ class PrintZoneAligner:
             cv2.putText(annotated, "Teach a PCB core", (12, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
             return annotated, None, "Teach one PCB core example."
 
-        gray = self._normalize(frame)
+        frame_height, frame_width = frame.shape[:2]
+        if search_region is None:
+            search_left, search_top = 0, 0
+            search_right, search_bottom = frame_width, frame_height
+        else:
+            search_left = max(0, search_region.x)
+            search_top = max(0, search_region.y)
+            search_right = min(frame_width, search_region.x + search_region.width)
+            search_bottom = min(frame_height, search_region.y + search_region.height)
+            if search_right <= search_left or search_bottom <= search_top:
+                search_left, search_top = 0, 0
+                search_right, search_bottom = frame_width, frame_height
+        search_frame = frame[search_top:search_bottom, search_left:search_right]
+        gray = self._normalize(search_frame)
         detected_by_type: list[list[tuple[Rectangle, float]]] = [[], []]
         for type_index, zone in enumerate(zones):
             if zone is None:
                 continue
             candidates: list[tuple[Rectangle, float]] = []
             for sample in zone.samples:
+                if gray.shape[0] < sample.template.shape[0] or gray.shape[1] < sample.template.shape[1]:
+                    continue
                 result = cv2.matchTemplate(gray, sample.template, cv2.TM_CCOEFF_NORMED)
-                candidates.extend(self._top_candidates(result, sample, zone.guide, self._MAX_DETECTIONS_PER_SAMPLE))
+                candidates.extend(
+                    self._top_candidates(
+                        result,
+                        sample,
+                        zone.guide,
+                        self._MAX_DETECTIONS_PER_SAMPLE,
+                        search_left,
+                        search_top,
+                    )
+                )
             detected_by_type[type_index] = [
                 candidate
                 for candidate in self._deduplicate_candidates(candidates)
@@ -355,7 +383,14 @@ class PrintZoneAligner:
         return kept
 
     @staticmethod
-    def _top_candidates(result: np.ndarray, sample: ZoneSample, guide: Rectangle, count: int = 8) -> list[tuple[Rectangle, float]]:
+    def _top_candidates(
+        result: np.ndarray,
+        sample: ZoneSample,
+        guide: Rectangle,
+        count: int = 8,
+        origin_x: int = 0,
+        origin_y: int = 0,
+    ) -> list[tuple[Rectangle, float]]:
         working = result.copy()
         candidates: list[tuple[Rectangle, float]] = []
         suppression = max(12, min(sample.template.shape) // 2)
@@ -363,6 +398,16 @@ class PrintZoneAligner:
             _, score, _, location = cv2.minMaxLoc(working)
             if score < PrintZoneAligner._MIN_SCORE:
                 break
-            candidates.append((Rectangle(location[0] + sample.target_offset_x, location[1] + sample.target_offset_y, guide.width, guide.height), float(score)))
+            candidates.append(
+                (
+                    Rectangle(
+                        origin_x + location[0] + sample.target_offset_x,
+                        origin_y + location[1] + sample.target_offset_y,
+                        guide.width,
+                        guide.height,
+                    ),
+                    float(score),
+                )
+            )
             cv2.rectangle(working, (max(0, location[0] - suppression), max(0, location[1] - suppression)), (min(working.shape[1] - 1, location[0] + suppression), min(working.shape[0] - 1, location[1] + suppression)), -1.0, -1)
         return candidates

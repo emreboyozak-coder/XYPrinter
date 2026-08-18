@@ -41,6 +41,20 @@ def test_context_keeps_a_plain_print_zone_distinct() -> None:
     assert measurement.score_1 >= 0.70
 
 
+def test_search_region_returns_coordinates_in_the_full_camera_frame() -> None:
+    reference = _reference_frame()
+    aligner = PrintZoneAligner()
+    aligner.teach(0, reference, Rectangle(80, 100, 66, 51))
+
+    full_frame = np.full((480, 800, 3), 220, dtype=np.uint8)
+    full_frame[120:360, 200:600] = reference
+    _, measurement, status = aligner.process(full_frame, Rectangle(200, 120, 400, 240))
+
+    assert measurement is not None, status
+    assert abs(measurement.midpoint_x - 313.0) < 2
+    assert abs(measurement.midpoint_y - 245.5) < 2
+
+
 def test_taught_zones_persist_between_application_starts(tmp_path) -> None:
     reference = _reference_frame()
     path = tmp_path / "print-zone-templates.npz"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import sys
 import threading
 import time
@@ -35,6 +36,39 @@ from marker.motion.controller import MotionController, discover_ports
 from marker.vision.zone_alignment import AlignmentMeasurement, PrintZoneAligner, Rectangle
 
 logger = logging.getLogger(__name__)
+
+
+def configure_opencv_hardware() -> tuple[int, bool]:
+    """Enable OpenCV acceleration while leaving one CPU thread for the UI/camera."""
+    logical_cpus = os.cpu_count() or 2
+    default_threads = max(1, logical_cpus - 1)
+    configured_threads = os.environ.get("PCB_PRINTER_CV_THREADS", "").strip()
+    try:
+        thread_count = max(1, int(configured_threads)) if configured_threads else default_threads
+    except ValueError:
+        logger.warning(
+            "Ignoring invalid PCB_PRINTER_CV_THREADS=%r; using %d threads",
+            configured_threads,
+            default_threads,
+        )
+        thread_count = default_threads
+
+    cv2.setUseOptimized(True)
+    cv2.setNumThreads(thread_count)
+
+    opencl_enabled = False
+    if hasattr(cv2, "ocl") and cv2.ocl.haveOpenCL():
+        cv2.ocl.setUseOpenCL(True)
+        opencl_enabled = bool(cv2.ocl.useOpenCL())
+
+    logger.info(
+        "OpenCV hardware acceleration: optimized=%s, CPU threads=%d/%d, OpenCL=%s",
+        cv2.useOptimized(),
+        cv2.getNumThreads(),
+        logical_cpus,
+        opencl_enabled,
+    )
+    return cv2.getNumThreads(), opencl_enabled
 
 
 class CameraPreview(QLabel):
@@ -155,6 +189,7 @@ class CameraThread(QThread):
     """Drains DroidCam continuously and analyzes only the newest available frame."""
 
     ANALYSIS_INTERVAL_S = 0.2
+    TARGET_SEARCH_SCALES = (0.50, 0.75, 1.0)
 
     frame_ready = pyqtSignal(int, QImage)
     connection_changed = pyqtSignal(int, bool, str)
@@ -175,10 +210,33 @@ class CameraThread(QThread):
         self.aligner = PrintZoneAligner()
         self.loaded_saved_zones = self.aligner.load(template_path)
         self._last_status = ""
+        self._target_search_enabled = False
+        self._target_search_level = 0
 
     def stop(self) -> None:
         self._running = False
         self._frame_available.set()
+
+    def set_target_search_enabled(self, enabled: bool) -> None:
+        """Use a center-focused search during core navigation, with full-frame fallback."""
+        self._target_search_enabled = enabled
+        self._target_search_level = 0
+
+    def _target_search_region(self, frame: object) -> Optional[Rectangle]:
+        if not self._target_search_enabled:
+            return None
+        height, width = frame.shape[:2]  # type: ignore[attr-defined]
+        scale = self.TARGET_SEARCH_SCALES[self._target_search_level]
+        if scale >= 1.0:
+            return None
+        region_width = max(1, round(width * scale))
+        region_height = max(1, round(height * scale))
+        return Rectangle(
+            (width - region_width) // 2,
+            (height - region_height) // 2,
+            region_width,
+            region_height,
+        )
 
     def teach_zone(self, index: int, rectangle: Rectangle, append: bool) -> None:
         with self._frame_lock:
@@ -279,7 +337,24 @@ class CameraThread(QThread):
                 frame = self._latest_frame.copy()
                 processed_serial = self._latest_frame_serial
             next_analysis_at = time.monotonic() + self.ANALYSIS_INTERVAL_S
-            display_frame, measurement, status = self.aligner.process(frame)
+            search_region = self._target_search_region(frame)
+            display_frame, measurement, status = self.aligner.process(frame, search_region)
+            if self._target_search_enabled:
+                if measurement is None:
+                    self._target_search_level = min(
+                        self._target_search_level + 1,
+                        len(self.TARGET_SEARCH_SCALES) - 1,
+                    )
+                else:
+                    self._target_search_level = 0
+                if search_region is not None:
+                    cv2.rectangle(
+                        display_frame,
+                        (search_region.x, search_region.y),
+                        (search_region.x + search_region.width, search_region.y + search_region.height),
+                        (0, 165, 255),
+                        2,
+                    )
             pcb_count, core_count = self.aligner.detection_counts()
             self.detection_counts_changed.emit(self.session, pcb_count, core_count)
             frame_height, frame_width = display_frame.shape[:2]
@@ -338,6 +413,8 @@ class PCBPrinterGUI(QMainWindow):
 
     def __init__(self) -> None:
         super().__init__()
+        logging.basicConfig(level=logging.INFO)
+        configure_opencv_hardware()
         self.setWindowTitle("PCB Printer Motion and Vision Alignment")
         self.setMinimumSize(1050, 650)
 
@@ -376,7 +453,6 @@ class PCBPrinterGUI(QMainWindow):
         self._calibration_wait_serial: Optional[int] = None
 
         self._build_ui()
-        logging.basicConfig(level=logging.INFO)
         QTimer.singleShot(0, self.connect_camera)
         QTimer.singleShot(30_000, self.capture_startup_position)
 
@@ -675,6 +751,7 @@ class PCBPrinterGUI(QMainWindow):
         )
         self.status_label.setText(message)
         if pcb_count == self.EXPECTED_PCB_COUNT and core_count == self.EXPECTED_CORE_COUNT:
+            self._full_layout_capture_saved = True
             if primary_x is not None and primary_y is not None:
                 self._reference_primary_core = (primary_x, primary_y)
                 self._reference_machine_position = (self.current_x, self.current_y)
@@ -728,7 +805,6 @@ class PCBPrinterGUI(QMainWindow):
         self._core_navigation_ready = False
         message = f"All {pcb_count} PCBs and {core_count} cores were detected and saved.\n{path}"
         self.status_label.setText(message)
-        QMessageBox.information(self, "Complete PCB/Core Capture", message)
 
     def on_camera_connection_changed(self, session: int, connected: bool, message: str) -> None:
         if session != self._camera_session:
@@ -855,6 +931,10 @@ class PCBPrinterGUI(QMainWindow):
             return
         self.alignment_label.setText(message)
 
+    def _set_target_search_enabled(self, enabled: bool) -> None:
+        if self.camera_thread:
+            self.camera_thread.set_target_search_enabled(enabled)
+
     def on_alignment_measurement(self, session: int, midpoint_x: float, midpoint_y: float, error_x: float, error_y: float, score_1: float, score_2: float, center_x: float, center_y: float, primary_x: float, primary_y: float) -> None:
         if session != self._camera_session:
             return
@@ -869,6 +949,7 @@ class PCBPrinterGUI(QMainWindow):
         self._update_motion_ui()
 
     def move_to_position(self) -> None:
+        self._set_target_search_enabled(False)
         self._start_move(self.x_spinbox.value(), self.y_spinbox.value(), "Moving")
 
     def _start_move(self, target_x: float, target_y: float, action: str) -> None:
@@ -903,6 +984,7 @@ class PCBPrinterGUI(QMainWindow):
             self._auto_center_y_correction = None
             self._current_core_target_index = 0
             self._core_navigation_ready = True
+            self._set_target_search_enabled(True)
             message = "PCB 1 Core 1 automatic X/Y centering is complete."
             self.status_label.setText(message)
             self._update_motion_ui()
@@ -929,6 +1011,7 @@ class PCBPrinterGUI(QMainWindow):
     def calibrate_x(self) -> None:
         if not self.last_measurement or not self.camera_thread:
             return
+        self._set_target_search_enabled(False)
         try:
             self._pending_calibration_frame = self.camera_thread.latest_frame_copy()
         except RuntimeError as exc:
@@ -986,6 +1069,7 @@ class PCBPrinterGUI(QMainWindow):
     def calibrate_y(self) -> None:
         if not self.last_measurement or not self.camera_thread:
             return
+        self._set_target_search_enabled(False)
         try:
             self._pending_calibration_frame = self.camera_thread.latest_frame_copy()
         except RuntimeError as exc:
@@ -1106,6 +1190,7 @@ class PCBPrinterGUI(QMainWindow):
         return float(transform[0, 2]), float(transform[1, 2]), float(inlier_ratio)
 
     def start_auto_center_primary_core(self) -> None:
+        self._set_target_search_enabled(False)
         if self._reference_primary_core is None or self._reference_machine_position is None:
             self.status_label.setText("Could not center PCB 1 Core 1: the complete 20-PCB/40-core reference photo is not available.")
             return
@@ -1135,6 +1220,7 @@ class PCBPrinterGUI(QMainWindow):
             self._auto_center_y_correction = None
             self._current_core_target_index = 0
             self._core_navigation_ready = True
+            self._set_target_search_enabled(True)
             message = "PCB 1 Core 1 is already centered on Y; automatic centering is complete."
             self.status_label.setText(message)
             self._update_motion_ui()
@@ -1204,6 +1290,7 @@ class PCBPrinterGUI(QMainWindow):
         target_y = self._reference_machine_position[1] + correction_y
         self._current_core_target_index = next_index
         self._navigation_target_label = f"PCB {pcb_number} Core {core_number}"
+        self._set_target_search_enabled(True)
         self._start_move(target_x, target_y, f"Moving to {self._navigation_target_label}")
 
     def _set_position_labels(self) -> None:
