@@ -23,4 +23,10 @@ constexpr float LEAD_SCREW_PITCH_MM = 4.0f;
 constexpr float MM_PER_STEP = LEAD_SCREW_PITCH_MM / STEPS_PER_TURN;  // 0.01 mm/step
 constexpr float STEPS_PER_MM = STEPS_PER_TURN / LEAD_SCREW_PITCH_MM; // 100 steps/mm
 
+// Motion speed limits. The F parameter in a MOVE command is interpreted as
+// step pulses per second. A larger F value therefore means faster movement.
+constexpr float MIN_FEED_STEPS_PER_SECOND = 1.0f;
+constexpr float MAX_FEED_STEPS_PER_SECOND = 1000.0f;
+constexpr float DEFAULT_FEED_STEPS_PER_SECOND = 20.0f;
+
 #endif

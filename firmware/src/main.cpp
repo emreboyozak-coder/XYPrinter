@@ -70,15 +70,52 @@ bool parseFloatToken(const char* key, const char* value, float& outValue) {
   return false;
 }
 
-void pulseStep(uint8_t pulPin, uint8_t dirPin, uint16_t steps, bool directionPositive, unsigned long delayUs) {
+float clampFeedRate(float feedStepsPerSecond) {
+  if (feedStepsPerSecond < MIN_FEED_STEPS_PER_SECOND) {
+    return MIN_FEED_STEPS_PER_SECOND;
+  }
+  if (feedStepsPerSecond > MAX_FEED_STEPS_PER_SECOND) {
+    return MAX_FEED_STEPS_PER_SECOND;
+  }
+  return feedStepsPerSecond;
+}
+
+unsigned long feedRateToPulseDelayUs(float feedStepsPerSecond) {
+  const float safeFeed = clampFeedRate(feedStepsPerSecond);
+
+  // One complete step pulse consists of a HIGH and a LOW interval.
+  // Example: F=200 -> 2500 us HIGH + 2500 us LOW -> 200 steps/s.
+  return (unsigned long)(500000.0f / safeFeed);
+}
+
+float feedRateToMmPerSecond(float feedStepsPerSecond) {
+  return clampFeedRate(feedStepsPerSecond) / STEPS_PER_MM;
+}
+
+void delayMicrosecondsSafe(unsigned long durationUs) {
+  // On AVR boards delayMicroseconds() accepts a 16-bit value and is only
+  // reliable for relatively short waits. Splitting long waits prevents low F
+  // values (for example F=10 -> 50000 us) from overflowing or running fast.
+  constexpr unsigned int MAX_DELAY_CHUNK_US = 10000U;
+  while (durationUs > MAX_DELAY_CHUNK_US) {
+    delayMicroseconds(MAX_DELAY_CHUNK_US);
+    durationUs -= MAX_DELAY_CHUNK_US;
+  }
+  if (durationUs > 0) {
+    delayMicroseconds((unsigned int)durationUs);
+  }
+}
+
+void pulseStep(uint8_t pulPin, uint8_t dirPin, uint16_t steps, bool directionPositive, float feedStepsPerSecond) {
+  const unsigned long pulseDelayUs = feedRateToPulseDelayUs(feedStepsPerSecond);
   digitalWrite(dirPin, directionPositive ? HIGH : LOW);
   delayMicroseconds(1000);
 
   for (uint16_t i = 0; i < steps; ++i) {
     digitalWrite(pulPin, HIGH);
-    delayMicroseconds(delayUs);
+    delayMicrosecondsSafe(pulseDelayUs);
     digitalWrite(pulPin, LOW);
-    delayMicroseconds(delayUs);
+    delayMicrosecondsSafe(pulseDelayUs);
   }
 }
 
@@ -90,7 +127,7 @@ void processMoveCommand(const ParsedCommand& cmd, const char* line) {
   token = strtok(nullptr, " \t");
   float xTarget = 0.0f;
   float yTarget = 0.0f;
-  float feed = 10.0f;
+  float feed = DEFAULT_FEED_STEPS_PER_SECOND;
 
   while ((token = strtok(nullptr, " \t")) != nullptr) {
     if (strncmp(token, "X=", 2) == 0) {
@@ -104,17 +141,17 @@ void processMoveCommand(const ParsedCommand& cmd, const char* line) {
 
   const float deltaX = xTarget - currentX;
   const float deltaY = yTarget - currentY;
-  const unsigned long pulseDelay = feed > 0.0f ? (unsigned long)(500000.0f / feed) : 5000UL;
+  const float safeFeed = clampFeedRate(feed);
 
   if (deltaX != 0.0f) {
     const uint16_t stepCount = (uint16_t)abs((int)round(deltaX * STEPS_PER_MM));
-    pulseStep(X_PUL_PIN, X_DIR_PIN, stepCount, deltaX > 0.0f, pulseDelay);
+    pulseStep(X_PUL_PIN, X_DIR_PIN, stepCount, deltaX > 0.0f, safeFeed);
     currentX = xTarget;
   }
 
   if (deltaY != 0.0f) {
     const uint16_t stepCount = (uint16_t)abs((int)round(deltaY * STEPS_PER_MM));
-    pulseStep(Y_PUL_PIN, Y_DIR_PIN, stepCount, deltaY > 0.0f, pulseDelay);
+    pulseStep(Y_PUL_PIN, Y_DIR_PIN, stepCount, deltaY > 0.0f, safeFeed);
     currentY = yTarget;
   }
 
