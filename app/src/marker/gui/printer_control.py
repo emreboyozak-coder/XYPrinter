@@ -206,12 +206,19 @@ class CameraThread(QThread):
         self._frame_lock = threading.Lock()
         self._latest_frame: Optional[object] = None
         self._latest_frame_serial = 0
+        self._last_processed_frame: Optional[object] = None
+        self._last_processed_measurement: Optional[AlignmentMeasurement] = None
+        self._last_processed_counts = (0, 0)
+        self._last_processed_core_targets: list[tuple[int, int, float, float]] = []
         self._frame_available = threading.Event()
         self.aligner = PrintZoneAligner()
         self.loaded_saved_zones = self.aligner.load(template_path)
         self._last_status = ""
         self._target_search_enabled = False
         self._target_search_level = 0
+        self._analysis_enabled = False
+        self._freeze_display = False
+        self._analysis_lock = threading.Lock()
 
     def stop(self) -> None:
         self._running = False
@@ -221,6 +228,22 @@ class CameraThread(QThread):
         """Use a center-focused search during core navigation, with full-frame fallback."""
         self._target_search_enabled = enabled
         self._target_search_level = 0
+
+    def start_panel_scan(self) -> None:
+        """Enable detection until the GUI accepts and locks a complete panel."""
+        with self._analysis_lock:
+            self._analysis_enabled = True
+            self._freeze_display = False
+        self._target_search_enabled = False
+        self._target_search_level = 0
+        self._frame_available.set()
+
+    def stop_image_processing(self, *, freeze_display: bool) -> None:
+        """Stop PCB/core detection while optionally keeping the accepted overlay visible."""
+        with self._analysis_lock:
+            self._analysis_enabled = False
+            self._freeze_display = freeze_display
+        self._frame_available.set()
 
     def _target_search_region(self, frame: object) -> Optional[Rectangle]:
         if not self._target_search_enabled:
@@ -273,11 +296,12 @@ class CameraThread(QThread):
 
     def save_latest_frame(self, path: Path, x: float, y: float) -> tuple[int, int, Optional[float], Optional[float], list[tuple[int, int, float, float]]]:
         with self._frame_lock:
-            if self._latest_frame is None:
-                raise RuntimeError("No camera frame is available")
-            raw_frame = self._latest_frame.copy()
-        frame, measurement, _ = self.aligner.process(raw_frame)
-        counts = self.aligner.detection_counts()
+            if self._last_processed_frame is None:
+                raise RuntimeError("No analyzed panel frame is available")
+            frame = self._last_processed_frame.copy()
+            measurement = self._last_processed_measurement
+            counts = self._last_processed_counts
+            core_targets = list(self._last_processed_core_targets)
         cv2.putText(
             frame,
             f"Position X={x:.3f} mm  Y={y:.3f} mm",
@@ -292,7 +316,7 @@ class CameraThread(QThread):
             raise RuntimeError(f"Could not write snapshot: {path}")
         primary_x = measurement.primary_x if measurement is not None else None
         primary_y = measurement.primary_y if measurement is not None else None
-        return counts[0], counts[1], primary_x, primary_y, self.aligner.numbered_core_centers()
+        return counts[0], counts[1], primary_x, primary_y, core_targets
 
     def _emit_status(self, status: str) -> None:
         if status != self._last_status:
@@ -328,6 +352,11 @@ class CameraThread(QThread):
         while self._running:
             self._frame_available.wait(timeout=0.25)
             self._frame_available.clear()
+            with self._analysis_lock:
+                analysis_enabled = self._analysis_enabled
+                freeze_display = self._freeze_display
+            if freeze_display:
+                continue
             delay = next_analysis_at - time.monotonic()
             if delay > 0:
                 time.sleep(delay)
@@ -337,9 +366,14 @@ class CameraThread(QThread):
                 frame = self._latest_frame.copy()
                 processed_serial = self._latest_frame_serial
             next_analysis_at = time.monotonic() + self.ANALYSIS_INTERVAL_S
-            search_region = self._target_search_region(frame)
-            display_frame, measurement, status = self.aligner.process(frame, search_region)
-            if self._target_search_enabled:
+            search_region = self._target_search_region(frame) if analysis_enabled else None
+            if analysis_enabled:
+                display_frame, measurement, status = self.aligner.process(frame, search_region)
+            else:
+                display_frame = frame
+                measurement = None
+                status = "Panel scan is idle. Press Panel Scan to detect 20 PCBs and 40 cores."
+            if analysis_enabled and self._target_search_enabled:
                 if measurement is None:
                     self._target_search_level = min(
                         self._target_search_level + 1,
@@ -355,8 +389,14 @@ class CameraThread(QThread):
                         (0, 165, 255),
                         2,
                     )
-            pcb_count, core_count = self.aligner.detection_counts()
-            self.detection_counts_changed.emit(self.session, pcb_count, core_count)
+            if analysis_enabled:
+                pcb_count, core_count = self.aligner.detection_counts()
+                with self._frame_lock:
+                    self._last_processed_frame = display_frame.copy()
+                    self._last_processed_measurement = measurement
+                    self._last_processed_counts = (pcb_count, core_count)
+                    self._last_processed_core_targets = self.aligner.numbered_core_centers()
+                self.detection_counts_changed.emit(self.session, pcb_count, core_count)
             frame_height, frame_width = display_frame.shape[:2]
             center_x = frame_width // 2
             center_y = frame_height // 2
@@ -406,6 +446,7 @@ class PCBPrinterGUI(QMainWindow):
 
     CALIBRATION_DISTANCE_MM = 10.0
     MAX_AUTO_X_STEP_MM = 2.0
+    CAMERA_SETTLE_DELAY_MS = 5_000
     TEMPLATE_PATH = Path(__file__).resolve().parents[4] / "config" / "print-zone-templates.npz"
     STARTUP_CAPTURE_DIR = Path(__file__).resolve().parents[4] / "snapshots"
     EXPECTED_PCB_COUNT = 20
@@ -436,6 +477,7 @@ class PCBPrinterGUI(QMainWindow):
         self.detected_pcb_count = 0
         self.detected_core_count = 0
         self._full_layout_capture_saved = False
+        self._panel_scan_active = False
         self._reference_primary_core: Optional[tuple[float, float]] = None
         self._reference_machine_position: Optional[tuple[float, float]] = None
         self._reference_core_targets: list[tuple[int, int, float, float]] = []
@@ -454,7 +496,6 @@ class PCBPrinterGUI(QMainWindow):
 
         self._build_ui()
         QTimer.singleShot(0, self.connect_camera)
-        QTimer.singleShot(30_000, self.capture_startup_position)
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -512,6 +553,10 @@ class PCBPrinterGUI(QMainWindow):
         self.clear_pcb_button = QPushButton("Clear PCB Learning")
         self.clear_pcb_button.clicked.connect(lambda: self.clear_learning_type(1))
         camera_connection.addWidget(self.clear_pcb_button, 5, 0, 1, 4)
+        self.panel_scan_button = QPushButton("Panel Scan (20 PCB / 40 Core)")
+        self.panel_scan_button.clicked.connect(self.start_panel_scan)
+        self.panel_scan_button.setEnabled(False)
+        camera_connection.addWidget(self.panel_scan_button, 6, 0, 1, 4)
         camera_group_layout.addLayout(camera_connection)
         self.sample_library_label = QLabel("Samples: Core = 0, PCB = 0, false core = 0, false PCB = 0.")
         self.sample_library_label.setWordWrap(True)
@@ -718,6 +763,8 @@ class PCBPrinterGUI(QMainWindow):
         self._camera_session += 1
         self.camera_disconnect_button.setEnabled(False)
         self.camera_connect_button.setEnabled(True)
+        self.panel_scan_button.setEnabled(False)
+        self._panel_scan_active = False
 
     def on_camera_thread_finished(self, thread: CameraThread) -> None:
         if thread in self._retired_camera_threads:
@@ -729,9 +776,31 @@ class PCBPrinterGUI(QMainWindow):
             return
         self.camera_label.show_image(image)
 
+    def start_panel_scan(self) -> None:
+        if not self.camera_thread or not self.camera_thread.isRunning():
+            self.status_label.setText("Connect the camera before starting Panel Scan.")
+            return
+        core_samples, pcb_samples = self.camera_thread.aligner.sample_counts()
+        if core_samples == 0 or pcb_samples == 0:
+            self.status_label.setText("Teach at least one Core and one PCB sample before Panel Scan.")
+            return
+        self._panel_scan_active = True
+        self._full_layout_capture_saved = False
+        self.detected_pcb_count = 0
+        self.detected_core_count = 0
+        self._reference_primary_core = None
+        self._reference_machine_position = None
+        self._reference_core_targets = []
+        self._core_navigation_ready = False
+        self.panel_scan_button.setEnabled(False)
+        self.panel_scan_button.setText("Scanning: 0/20 PCB, 0/40 Core")
+        self.camera_thread.start_panel_scan()
+        self.alignment_label.setText("Panel Scan active: searching the current view for 20 PCBs and 40 cores.")
+        self.status_label.setText("Panel Scan started. Keep the panel and camera stationary.")
+
     def capture_startup_position(self) -> None:
         if not self.camera_thread or not self.camera_thread.isRunning():
-            message = "The 30-second startup capture failed because the camera is not connected."
+            message = "The startup capture failed because the camera is not connected."
             self.status_label.setText(message)
             QMessageBox.warning(self, "Startup Capture", message)
             return
@@ -741,7 +810,7 @@ class PCBPrinterGUI(QMainWindow):
         try:
             pcb_count, core_count, primary_x, primary_y, core_targets = self.camera_thread.save_latest_frame(path, self.current_x, self.current_y)
         except Exception as exc:
-            message = f"The 30-second startup capture failed: {exc}"
+            message = f"The startup capture failed: {exc}"
             self.status_label.setText(message)
             QMessageBox.warning(self, "Startup Capture", message)
             return
@@ -772,7 +841,11 @@ class PCBPrinterGUI(QMainWindow):
             return
         self.detected_pcb_count = pcb_count
         self.detected_core_count = core_count
+        if self._panel_scan_active:
+            self.panel_scan_button.setText(f"Scanning: {pcb_count}/20 PCB, {core_count}/40 Core")
         if (
+            self._panel_scan_active
+            and
             not self._full_layout_capture_saved
             and pcb_count == self.EXPECTED_PCB_COUNT
             and core_count == self.EXPECTED_CORE_COUNT
@@ -803,8 +876,21 @@ class PCBPrinterGUI(QMainWindow):
         self._reference_core_targets = core_targets
         self._current_core_target_index = 0
         self._core_navigation_ready = False
+        self._panel_scan_active = False
+        self.camera_thread.stop_image_processing(freeze_display=False)
+        self.panel_scan_button.setText("Panel Scan (20 PCB / 40 Core)")
+        self.panel_scan_button.setEnabled(True)
         message = f"All {pcb_count} PCBs and {core_count} cores were detected and saved.\n{path}"
         self.status_label.setText(message)
+        self.alignment_label.setText(
+            "Panel locked: 20 PCBs and 40 cores saved. Image processing is stopped; live camera remains active."
+        )
+        self._update_motion_ui()
+        QMessageBox.information(
+            self,
+            "Panel Scan Complete",
+            message + "\nImage processing has stopped; the live camera remains active.",
+        )
 
     def on_camera_connection_changed(self, session: int, connected: bool, message: str) -> None:
         if session != self._camera_session:
@@ -813,6 +899,7 @@ class PCBPrinterGUI(QMainWindow):
         self.camera_disconnect_button.setEnabled(connected)
         self.camera_ip_input.setEnabled(not connected)
         self.camera_port_input.setEnabled(not connected)
+        self.panel_scan_button.setEnabled(connected and not self._panel_scan_active)
         if not connected:
             self.camera_label.setText(message)
         self.status_label.setText(message)
@@ -897,6 +984,11 @@ class PCBPrinterGUI(QMainWindow):
     def clear_learning_type(self, index: int) -> None:
         if self.camera_thread:
             self.camera_thread.clear_learning_type(index)
+            self.camera_thread.stop_image_processing(freeze_display=False)
+        self._panel_scan_active = False
+        self._full_layout_capture_saved = False
+        self.panel_scan_button.setText("Panel Scan (20 PCB / 40 Core)")
+        self.panel_scan_button.setEnabled(bool(self.camera_thread and self.camera_thread.isRunning()))
         self.last_measurement = None
         self.pixels_per_mm_x = None
         self.center_pixels_per_mm_x = None
@@ -969,16 +1061,16 @@ class PCBPrinterGUI(QMainWindow):
         self._update_motion_ui()
         if self._pending_calibration:
             self._calibration_wait_serial = self._measurement_serial
-            self.status_label.setText("X calibration move complete. Waiting 30 seconds for an updated camera frame...")
-            QTimer.singleShot(30_000, self.finish_x_calibration)
+            self.status_label.setText("X calibration move complete. Waiting 5 seconds for an updated camera frame...")
+            QTimer.singleShot(self.CAMERA_SETTLE_DELAY_MS, self.finish_x_calibration)
         elif self._pending_y_calibration:
             self._calibration_wait_serial = self._measurement_serial
-            self.status_label.setText("Y calibration move complete. Waiting 30 seconds for an updated camera frame...")
-            QTimer.singleShot(30_000, self.finish_y_calibration)
+            self.status_label.setText("Y calibration move complete. Waiting 5 seconds for an updated camera frame...")
+            QTimer.singleShot(self.CAMERA_SETTLE_DELAY_MS, self.finish_y_calibration)
         elif self._auto_center_phase == "x":
             self._auto_center_phase = "waiting_y"
-            self.status_label.setText("PCB 1 Core 1 X centering complete. Waiting 30 seconds before Y centering...")
-            QTimer.singleShot(30_000, self._continue_auto_center_y)
+            self.status_label.setText("PCB 1 Core 1 X centering complete. Waiting 5 seconds before Y centering...")
+            QTimer.singleShot(self.CAMERA_SETTLE_DELAY_MS, self._continue_auto_center_y)
         elif self._auto_center_phase == "y":
             self._auto_center_phase = None
             self._auto_center_y_correction = None
