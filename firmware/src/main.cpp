@@ -92,6 +92,26 @@ float feedRateToMmPerSecond(float feedStepsPerSecond) {
   return clampFeedRate(feedStepsPerSecond) / STEPS_PER_MM;
 }
 
+float rampedFeedRate(uint16_t stepIndex, uint16_t totalSteps, float targetFeedStepsPerSecond) {
+  const float targetFeed = clampFeedRate(targetFeedStepsPerSecond);
+  const float startFeed = min(targetFeed, RAMP_START_FEED_STEPS_PER_SECOND);
+  if (totalSteps <= 1 || targetFeed <= startFeed) {
+    return targetFeed;
+  }
+
+  // Distance from the nearest end gives a symmetric acceleration/deceleration
+  // profile. v^2 = v0^2 + 2*a*s naturally becomes triangular on short moves
+  // and trapezoidal when the requested feed can be reached.
+  const uint16_t stepsFromStart = stepIndex;
+  const uint16_t stepsUntilStop = totalSteps - stepIndex - 1;
+  const float rampDistanceSteps = (float)min(stepsFromStart, stepsUntilStop);
+  const float rampFeed = sqrtf(
+    startFeed * startFeed
+    + 2.0f * ACCELERATION_STEPS_PER_SECOND_SQUARED * rampDistanceSteps
+  );
+  return min(targetFeed, rampFeed);
+}
+
 void delayMicrosecondsSafe(unsigned long durationUs) {
   // On AVR boards delayMicroseconds() accepts a 16-bit value and is only
   // reliable for relatively short waits. Splitting long waits prevents low F
@@ -107,11 +127,12 @@ void delayMicrosecondsSafe(unsigned long durationUs) {
 }
 
 void pulseStep(uint8_t pulPin, uint8_t dirPin, uint16_t steps, bool directionPositive, float feedStepsPerSecond) {
-  const unsigned long pulseDelayUs = feedRateToPulseDelayUs(feedStepsPerSecond);
   digitalWrite(dirPin, directionPositive ? HIGH : LOW);
   delayMicroseconds(1000);
 
   for (uint16_t i = 0; i < steps; ++i) {
+    const float currentFeed = rampedFeedRate(i, steps, feedStepsPerSecond);
+    const unsigned long pulseDelayUs = feedRateToPulseDelayUs(currentFeed);
     digitalWrite(pulPin, HIGH);
     delayMicrosecondsSafe(pulseDelayUs);
     digitalWrite(pulPin, LOW);

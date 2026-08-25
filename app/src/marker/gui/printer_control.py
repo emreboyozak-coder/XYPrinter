@@ -648,7 +648,7 @@ class PCBPrinterGUI(QMainWindow):
         self.x_spinbox = self._coordinate_input()
         self.y_spinbox = self._coordinate_input()
         self.speed_spinbox = QDoubleSpinBox()
-        self.speed_spinbox.setRange(5.0, 1000.0)
+        self.speed_spinbox.setRange(5.0, 2000.0)
         self.speed_spinbox.setValue(20.0)
         self.speed_spinbox.setDecimals(1)
         self.speed_spinbox.setSingleStep(5.0)

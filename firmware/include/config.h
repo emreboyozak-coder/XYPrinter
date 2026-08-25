@@ -26,7 +26,12 @@ constexpr float STEPS_PER_MM = STEPS_PER_TURN / LEAD_SCREW_PITCH_MM; // 100 step
 // Motion speed limits. The F parameter in a MOVE command is interpreted as
 // step pulses per second. A larger F value therefore means faster movement.
 constexpr float MIN_FEED_STEPS_PER_SECOND = 1.0f;
-constexpr float MAX_FEED_STEPS_PER_SECOND = 1000.0f;
+constexpr float MAX_FEED_STEPS_PER_SECOND = 2000.0f;
 constexpr float DEFAULT_FEED_STEPS_PER_SECOND = 20.0f;
+
+// Trapezoidal motion profile. Every move starts and ends at the ramp feed;
+// longer moves accelerate up to the requested F value between those ramps.
+constexpr float RAMP_START_FEED_STEPS_PER_SECOND = 20.0f;
+constexpr float ACCELERATION_STEPS_PER_SECOND_SQUARED = 800.0f;
 
 #endif
