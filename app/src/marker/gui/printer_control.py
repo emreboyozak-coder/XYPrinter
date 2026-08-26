@@ -29,6 +29,8 @@ from PyQt5.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -522,10 +524,20 @@ class PCBPrinterGUI(QMainWindow):
         self.camera_label = CameraPreview()
         self.camera_label.setText("Connecting to DroidCam...")
         self.camera_label.setAlignment(Qt.AlignCenter)
-        self.camera_label.setMinimumSize(640, 480)
+        self.camera_label.setMinimumSize(480, 320)
+        self.camera_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.camera_label.setStyleSheet("background: #171717; color: #f0f0f0;")
         self.camera_label.selection_made.connect(self.on_zone_selected)
         camera_group_layout.addWidget(self.camera_label)
+
+        camera_controls_scroll = QScrollArea()
+        camera_controls_scroll.setWidgetResizable(True)
+        camera_controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        camera_controls_scroll.setMinimumHeight(170)
+        camera_controls_scroll.setMaximumHeight(240)
+        camera_controls_widget = QWidget()
+        camera_controls_layout = QVBoxLayout(camera_controls_widget)
+        camera_controls_layout.setContentsMargins(4, 4, 4, 4)
 
         camera_connection = QGridLayout()
         camera_connection.addWidget(QLabel("WiFi IP"), 0, 0)
@@ -578,16 +590,18 @@ class PCBPrinterGUI(QMainWindow):
         self.teach_pick_place_origin_button.clicked.connect(self.teach_pick_place_origin)
         self.teach_pick_place_origin_button.setEnabled(False)
         camera_connection.addWidget(self.teach_pick_place_origin_button, 8, 0, 1, 4)
-        camera_group_layout.addLayout(camera_connection)
+        camera_controls_layout.addLayout(camera_connection)
         self.pick_place_label = QLabel("Pick and Place: no file loaded.")
         self.pick_place_label.setWordWrap(True)
-        camera_group_layout.addWidget(self.pick_place_label)
+        camera_controls_layout.addWidget(self.pick_place_label)
         self.sample_library_label = QLabel("Samples: Core = 0, PCB = 0, false core = 0, false PCB = 0.")
         self.sample_library_label.setWordWrap(True)
-        camera_group_layout.addWidget(self.sample_library_label)
+        camera_controls_layout.addWidget(self.sample_library_label)
         self.alignment_label = QLabel("Teach one PCB core example to detect all matching cores.")
         self.alignment_label.setWordWrap(True)
-        camera_group_layout.addWidget(self.alignment_label)
+        camera_controls_layout.addWidget(self.alignment_label)
+        camera_controls_scroll.setWidget(camera_controls_widget)
+        camera_group_layout.addWidget(camera_controls_scroll)
         camera_layout.addWidget(camera_group)
         layout.addLayout(camera_layout, 2)
 
