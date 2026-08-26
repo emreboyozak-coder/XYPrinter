@@ -20,6 +20,7 @@ from PyQt5.QtGui import QFont, QImage, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
+    QFileDialog,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -34,6 +35,7 @@ from PyQt5.QtWidgets import (
 )
 
 from marker.motion.controller import MotionController, discover_ports
+from marker.pick_place import NumberedCore, load_pick_place, machine_coordinates
 from marker.vision.zone_alignment import AlignmentMeasurement, PrintZoneAligner, Rectangle
 
 logger = logging.getLogger(__name__)
@@ -487,6 +489,9 @@ class PCBPrinterGUI(QMainWindow):
         self.detected_core_count = 0
         self._full_layout_capture_saved = False
         self._panel_scan_active = False
+        self._pick_place_path: Optional[Path] = None
+        self._pick_place_cores: list[NumberedCore] = []
+        self._pick_place_origin_machine: Optional[tuple[float, float]] = None
         self._reference_primary_core: Optional[tuple[float, float]] = None
         self._reference_machine_position: Optional[tuple[float, float]] = None
         self._reference_core_targets: list[tuple[int, int, float, float]] = []
@@ -566,7 +571,17 @@ class PCBPrinterGUI(QMainWindow):
         self.panel_scan_button.clicked.connect(self.start_panel_scan)
         self.panel_scan_button.setEnabled(False)
         camera_connection.addWidget(self.panel_scan_button, 6, 0, 1, 4)
+        self.load_pick_place_button = QPushButton("Load Pick and Place")
+        self.load_pick_place_button.clicked.connect(self.load_pick_place_file)
+        camera_connection.addWidget(self.load_pick_place_button, 7, 0, 1, 4)
+        self.teach_pick_place_origin_button = QPushButton("Teach P&P Origin (0,0)")
+        self.teach_pick_place_origin_button.clicked.connect(self.teach_pick_place_origin)
+        self.teach_pick_place_origin_button.setEnabled(False)
+        camera_connection.addWidget(self.teach_pick_place_origin_button, 8, 0, 1, 4)
         camera_group_layout.addLayout(camera_connection)
+        self.pick_place_label = QLabel("Pick and Place: no file loaded.")
+        self.pick_place_label.setWordWrap(True)
+        camera_group_layout.addWidget(self.pick_place_label)
         self.sample_library_label = QLabel("Samples: Core = 0, PCB = 0, false core = 0, false PCB = 0.")
         self.sample_library_label.setWordWrap(True)
         camera_group_layout.addWidget(self.sample_library_label)
@@ -709,6 +724,13 @@ class PCBPrinterGUI(QMainWindow):
             self.motion_thread.motion_complete.connect(self.on_motion_complete)
             self.motion_thread.motion_error.connect(self.on_motion_error)
             self.current_x = self.current_y = 0.0
+            self._pick_place_origin_machine = None
+            self._current_core_target_index = -1
+            if self._pick_place_cores:
+                self.pick_place_label.setText(
+                    f"Pick and Place: {self._pick_place_path.name if self._pick_place_path else 'loaded'} - "
+                    "coordinates loaded; teach CAD (0,0) again after reconnecting."
+                )
             self._set_position_labels()
             self.is_connected = True
             self._update_motion_ui()
@@ -736,6 +758,8 @@ class PCBPrinterGUI(QMainWindow):
         self.move_button.setEnabled(self.is_connected and not moving)
         self.port_combo.setEnabled(not self.is_connected)
         self.refresh_button.setEnabled(not self.is_connected)
+        pick_place_ready = bool(self._pick_place_cores and self._pick_place_origin_machine is not None)
+        self.teach_pick_place_origin_button.setEnabled(self.is_connected and not moving and bool(self._pick_place_cores))
         can_align = self.is_connected and not moving and self.last_measurement is not None
         self.calibrate_x_button.setEnabled(can_align)
         self.align_x_button.setEnabled(can_align and self.pixels_per_mm_x is not None)
@@ -749,7 +773,8 @@ class PCBPrinterGUI(QMainWindow):
         )
         self.center_x_button.setEnabled(can_center)
         self.center_y_button.setEnabled(can_center)
-        self.next_core_button.setEnabled(can_center and self._core_navigation_ready and bool(self._reference_core_targets))
+        camera_navigation_ready = can_center and self._core_navigation_ready and bool(self._reference_core_targets)
+        self.next_core_button.setEnabled(self.is_connected and not moving and (pick_place_ready or camera_navigation_ready))
 
     def connect_camera(self) -> None:
         self.disconnect_camera()
@@ -793,6 +818,65 @@ class PCBPrinterGUI(QMainWindow):
         if session != self._camera_session:
             return
         self.camera_label.show_image(image)
+
+    def load_pick_place_file(self) -> None:
+        initial_directory = str(self._pick_place_path.parent if self._pick_place_path else Path.cwd())
+        filename, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load Pick and Place Core Coordinates",
+            initial_directory,
+            "Pick and Place files (*.csv *.txt *.tsv);;All files (*.*)",
+        )
+        if not filename:
+            return
+        path = Path(filename)
+        try:
+            numbered_cores = load_pick_place(path)
+        except Exception as exc:
+            self.status_label.setText(f"Pick and Place load failed: {exc}")
+            QMessageBox.warning(self, "Pick and Place Error", str(exc))
+            return
+
+        self._pick_place_path = path
+        self._pick_place_cores = numbered_cores
+        self._pick_place_origin_machine = None
+        self._current_core_target_index = -1
+        first = numbered_cores[0]
+        last = numbered_cores[-1]
+        self.pick_place_label.setText(
+            f"Pick and Place: {path.name} - 20 PCBs / 40 cores loaded and sorted. "
+            f"PCB 1 starts at ({first.core.x_mm:.3f}, {first.core.y_mm:.3f}) mm; "
+            f"PCB 20 ends at ({last.core.x_mm:.3f}, {last.core.y_mm:.3f}) mm."
+        )
+        self.status_label.setText(f"Pick and Place loaded: {path}")
+        self._update_motion_ui()
+        QMessageBox.information(
+            self,
+            "Pick and Place Loaded",
+            "40 unordered cores were paired into 20 PCBs and sorted by coordinate.\n"
+            "Move the machine to the physical CAD (0,0) point, then press Teach P&P Origin before motion.",
+        )
+
+    def teach_pick_place_origin(self) -> None:
+        if not self.is_connected:
+            self.status_label.setText("Connect the motion controller before teaching the Pick and Place origin.")
+            return
+        if not self._pick_place_cores:
+            self.status_label.setText("Load a Pick and Place file before teaching its origin.")
+            return
+        if self.motion_thread and self.motion_thread.isRunning():
+            return
+        self._pick_place_origin_machine = (self.current_x, self.current_y)
+        self._current_core_target_index = -1
+        self.pick_place_label.setText(
+            f"Pick and Place: {self._pick_place_path.name if self._pick_place_path else 'loaded'} - "
+            f"20 PCBs / 40 cores. CAD (0,0) taught at machine "
+            f"X={self.current_x:.3f}, Y={self.current_y:.3f} mm."
+        )
+        self.status_label.setText(
+            "Pick and Place origin taught. Next Core will use CSV X directly and CSV Y in the reverse direction."
+        )
+        self._update_motion_ui()
 
     def start_panel_scan(self) -> None:
         if not self.camera_thread or not self.camera_thread.isRunning():
@@ -1409,6 +1493,29 @@ class PCBPrinterGUI(QMainWindow):
         self._start_move(self.current_x, self.current_y + correction_y, "Centering Y on camera")
 
     def go_to_next_core(self) -> None:
+        if self._pick_place_cores and self._pick_place_origin_machine is not None:
+            next_index = (self._current_core_target_index + 1) % len(self._pick_place_cores)
+            numbered_core = self._pick_place_cores[next_index]
+            target_x, target_y = machine_coordinates(numbered_core.core, self._pick_place_origin_machine)
+            if not (
+                self.x_spinbox.minimum() <= target_x <= self.x_spinbox.maximum()
+                and self.y_spinbox.minimum() <= target_y <= self.y_spinbox.maximum()
+            ):
+                message = (
+                    f"Pick and Place target X={target_x:.3f}, Y={target_y:.3f} mm is outside "
+                    "the configured machine range. Check the taught origin and CSV units."
+                )
+                self.status_label.setText(message)
+                QMessageBox.warning(self, "Pick and Place Target Outside Range", message)
+                return
+            self._current_core_target_index = next_index
+            self._navigation_target_label = (
+                f"PCB {numbered_core.pcb_number} Core {numbered_core.core_number} "
+                f"({numbered_core.core.name})"
+            )
+            self._set_target_search_enabled(False)
+            self._start_move(target_x, target_y, f"Moving to {self._navigation_target_label} from Pick and Place")
+            return
         if (
             not self._core_navigation_ready
             or not self._reference_core_targets
