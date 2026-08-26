@@ -10,6 +10,9 @@ from pathlib import Path
 
 
 EXPECTED_CORE_COUNT = 40
+EXPECTED_PAIR_X_DISTANCE_MM = 13.8
+PAIR_X_TOLERANCE_MM = 0.5
+PAIR_Y_TOLERANCE_MM = 0.5
 
 
 @dataclass(frozen=True)
@@ -121,25 +124,7 @@ def load_pick_place(path: str | Path, *, expected_core_count: int = EXPECTED_COR
 
 
 def _number_cores(cores: list[PickPlaceCore]) -> list[NumberedCore]:
-    remaining = list(cores)
-    pairs: list[tuple[PickPlaceCore, PickPlaceCore]] = []
-    while remaining:
-        best_i, best_j = min(
-            (
-                (i, j)
-                for i in range(len(remaining))
-                for j in range(i + 1, len(remaining))
-            ),
-            key=lambda indexes: math.hypot(
-                remaining[indexes[0]].x_mm - remaining[indexes[1]].x_mm,
-                remaining[indexes[0]].y_mm - remaining[indexes[1]].y_mm,
-            ),
-        )
-        first = remaining[best_i]
-        second = remaining[best_j]
-        pairs.append((first, second))
-        for index in sorted((best_i, best_j), reverse=True):
-            remaining.pop(index)
+    pairs = _pair_cores_by_spacing(cores)
 
     def midpoint(pair: tuple[PickPlaceCore, PickPlaceCore]) -> tuple[float, float]:
         return ((pair[0].x_mm + pair[1].x_mm) / 2.0, (pair[0].y_mm + pair[1].y_mm) / 2.0)
@@ -159,8 +144,57 @@ def _number_cores(cores: list[PickPlaceCore]) -> list[NumberedCore]:
     pcb_number = 1
     for row in rows:
         for pair in sorted(row, key=lambda item: midpoint(item)[0]):
-            ordered_cores = sorted(pair, key=lambda core: (core.x_mm, core.y_mm))
+            def core_order(core: PickPlaceCore) -> tuple[int, float, float]:
+                match = re.match(r"core(\d+)(?:_|$)", core.name.strip(), flags=re.IGNORECASE)
+                return (int(match.group(1)) if match else 999999, core.x_mm, core.y_mm)
+
+            ordered_cores = sorted(pair, key=core_order)
             for core_number, core in enumerate(ordered_cores, start=1):
                 numbered.append(NumberedCore(pcb_number, core_number, core))
             pcb_number += 1
     return numbered
+
+
+def _pair_cores_by_spacing(cores: list[PickPlaceCore]) -> list[tuple[PickPlaceCore, PickPlaceCore]]:
+    """Find a complete pairing where every PCB has the configured X spacing."""
+    candidates: dict[int, list[int]] = {}
+    for index, core in enumerate(cores):
+        matches = []
+        for other_index, other in enumerate(cores):
+            if index == other_index:
+                continue
+            x_error = abs(abs(core.x_mm - other.x_mm) - EXPECTED_PAIR_X_DISTANCE_MM)
+            y_error = abs(core.y_mm - other.y_mm)
+            if x_error <= PAIR_X_TOLERANCE_MM and y_error <= PAIR_Y_TOLERANCE_MM:
+                matches.append(other_index)
+        candidates[index] = sorted(
+            matches,
+            key=lambda other_index: (
+                abs(abs(core.x_mm - cores[other_index].x_mm) - EXPECTED_PAIR_X_DISTANCE_MM),
+                abs(core.y_mm - cores[other_index].y_mm),
+            ),
+        )
+
+    def solve(remaining: frozenset[int]) -> list[tuple[int, int]] | None:
+        if not remaining:
+            return []
+        first = min(
+            remaining,
+            key=lambda index: sum(1 for candidate in candidates[index] if candidate in remaining),
+        )
+        for second in candidates[first]:
+            if second not in remaining:
+                continue
+            result = solve(remaining - {first, second})
+            if result is not None:
+                return [(first, second), *result]
+        return None
+
+    matched_indexes = solve(frozenset(range(len(cores))))
+    if matched_indexes is None:
+        raise ValueError(
+            f"The 40 cores could not be grouped into pairs with X spacing "
+            f"{EXPECTED_PAIR_X_DISTANCE_MM:.1f} +/- {PAIR_X_TOLERANCE_MM:.1f} mm "
+            f"and Y difference <= {PAIR_Y_TOLERANCE_MM:.1f} mm"
+        )
+    return [(cores[first], cores[second]) for first, second in matched_indexes]

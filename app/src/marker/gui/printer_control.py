@@ -844,7 +844,7 @@ class PCBPrinterGUI(QMainWindow):
         first = numbered_cores[0]
         last = numbered_cores[-1]
         self.pick_place_label.setText(
-            f"Pick and Place: {path.name} - 20 PCBs / 40 cores loaded and sorted. "
+            f"Pick and Place: {path.name} - 20 PCBs / 40 cores grouped at 13.8 mm X spacing and sorted. "
             f"PCB 1 starts at ({first.core.x_mm:.3f}, {first.core.y_mm:.3f}) mm; "
             f"PCB 20 ends at ({last.core.x_mm:.3f}, {last.core.y_mm:.3f}) mm."
         )
@@ -853,7 +853,7 @@ class PCBPrinterGUI(QMainWindow):
         QMessageBox.information(
             self,
             "Pick and Place Loaded",
-            "40 unordered cores were paired into 20 PCBs and sorted by coordinate.\n"
+            "40 unordered cores were paired into 20 PCBs using 13.8 mm X spacing and sorted by coordinate.\n"
             "Move the machine to the physical CAD (0,0) point, then press Teach P&P Origin before motion.",
         )
 
