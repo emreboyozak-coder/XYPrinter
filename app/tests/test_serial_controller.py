@@ -37,6 +37,11 @@ def test_move_serializes_selected_feed_rate(controller: MotionController) -> Non
     assert controller.port.queued_commands()[-1] == "$ID=1 CMD=MOVE X=0.000 Y=-10.000 F=75.0\n"
 
 
+def test_move_serializes_selected_acceleration(controller: MotionController) -> None:
+    controller.move_to(10.0, 20.0, 1500.0, acceleration=400.0)
+    assert controller.port.queued_commands()[-1] == "$ID=1 CMD=MOVE X=10.000 Y=20.000 F=1500.0 A=400.0\n"
+
+
 def test_firmware_error_is_raised(controller: MotionController) -> None:
     with pytest.raises(CommandExecutionError, match="UNSUPPORTED_COMMAND"):
         controller.home()

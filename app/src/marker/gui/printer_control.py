@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import sys
 import threading
@@ -172,14 +173,22 @@ class MotionThread(QThread):
         self.target_x = 0.0
         self.target_y = 0.0
         self.speed = 20.0
+        self.acceleration = 800.0
         self.timeout_s = 20.0
 
-    def set_target(self, x: float, y: float, speed: float, timeout_s: float) -> None:
-        self.target_x, self.target_y, self.speed, self.timeout_s = x, y, speed, timeout_s
+    def set_target(self, x: float, y: float, speed: float, acceleration: float, timeout_s: float) -> None:
+        self.target_x, self.target_y = x, y
+        self.speed, self.acceleration, self.timeout_s = speed, acceleration, timeout_s
 
     def run(self) -> None:
         try:
-            self.controller.move_to(self.target_x, self.target_y, self.speed, self.timeout_s)
+            self.controller.move_to(
+                self.target_x,
+                self.target_y,
+                self.speed,
+                timeout_s=self.timeout_s,
+                acceleration=self.acceleration,
+            )
             self.motion_complete.emit(self.target_x, self.target_y)
         except Exception as exc:
             self.motion_error.emit(str(exc))
@@ -653,16 +662,25 @@ class PCBPrinterGUI(QMainWindow):
         self.speed_spinbox.setDecimals(1)
         self.speed_spinbox.setSingleStep(5.0)
         self.speed_spinbox.setSuffix(" F")
+        self.acceleration_spinbox = QDoubleSpinBox()
+        self.acceleration_spinbox.setRange(100.0, 5000.0)
+        self.acceleration_spinbox.setValue(800.0)
+        self.acceleration_spinbox.setDecimals(0)
+        self.acceleration_spinbox.setSingleStep(100.0)
+        self.acceleration_spinbox.setSuffix(" step/s²")
+        self.acceleration_spinbox.setToolTip("Lower values are softer; higher values accelerate and stop more firmly.")
         group_layout.addWidget(QLabel("X target"), 0, 0)
         group_layout.addWidget(self.x_spinbox, 0, 1)
         group_layout.addWidget(QLabel("Y target"), 1, 0)
         group_layout.addWidget(self.y_spinbox, 1, 1)
         group_layout.addWidget(QLabel("Feed"), 2, 0)
         group_layout.addWidget(self.speed_spinbox, 2, 1)
+        group_layout.addWidget(QLabel("Acceleration (low = soft)"), 3, 0)
+        group_layout.addWidget(self.acceleration_spinbox, 3, 1)
         self.move_button = QPushButton("Move")
         self.move_button.clicked.connect(self.move_to_position)
         self.move_button.setEnabled(False)
-        group_layout.addWidget(self.move_button, 3, 0, 1, 2)
+        group_layout.addWidget(self.move_button, 4, 0, 1, 2)
         return group
 
     @staticmethod
@@ -1048,12 +1066,38 @@ class PCBPrinterGUI(QMainWindow):
         if not self.motion_thread or self.motion_thread.isRunning():
             return
         speed = self.speed_spinbox.value()
-        distance = abs(target_x - self.current_x) + abs(target_y - self.current_y)
-        timeout_s = max(20.0, (distance * 100.0 / speed) + 15.0)
-        self.motion_thread.set_target(target_x, target_y, speed, timeout_s)
-        self.status_label.setText(f"{action}: X={target_x:.3f} mm, Y={target_y:.3f} mm at F={speed:.1f}...")
+        acceleration = self.acceleration_spinbox.value()
+        x_steps = abs(target_x - self.current_x) * 100.0
+        y_steps = abs(target_y - self.current_y) * 100.0
+        timeout_s = max(
+            20.0,
+            self._estimated_axis_move_time(x_steps, speed, acceleration)
+            + self._estimated_axis_move_time(y_steps, speed, acceleration)
+            + 15.0,
+        )
+        self.motion_thread.set_target(target_x, target_y, speed, acceleration, timeout_s)
+        self.status_label.setText(
+            f"{action}: X={target_x:.3f} mm, Y={target_y:.3f} mm "
+            f"at F={speed:.1f}, A={acceleration:.0f}..."
+        )
         self.motion_thread.start()
         self._update_motion_ui()
+
+    @staticmethod
+    def _estimated_axis_move_time(steps: float, target_feed: float, acceleration: float) -> float:
+        if steps <= 0.0:
+            return 0.0
+        start_feed = min(target_feed, 20.0)
+        if target_feed <= start_feed:
+            return steps / target_feed
+        acceleration_steps = (target_feed * target_feed - start_feed * start_feed) / (2.0 * acceleration)
+        if steps >= 2.0 * acceleration_steps:
+            return (
+                2.0 * (target_feed - start_feed) / acceleration
+                + (steps - 2.0 * acceleration_steps) / target_feed
+            )
+        peak_feed = math.sqrt(start_feed * start_feed + acceleration * steps)
+        return 2.0 * (peak_feed - start_feed) / acceleration
 
     def on_motion_complete(self, x: float, y: float) -> None:
         self.current_x, self.current_y = x, y

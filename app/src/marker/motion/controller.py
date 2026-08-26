@@ -119,9 +119,17 @@ class MotionController:
     def home(self) -> None:
         self.send_command(f"$ID={self._next_command_id()} CMD=HOME")
 
-    def move_to(self, x: float, y: float, speed: float, timeout_s: float | None = None) -> None:
+    def move_to(
+        self,
+        x: float,
+        y: float,
+        speed: float,
+        timeout_s: float | None = None,
+        acceleration: float | None = None,
+    ) -> None:
+        acceleration_param = f" A={acceleration:.1f}" if acceleration is not None else ""
         self.send_command(
-            f"$ID={self._next_command_id()} CMD=MOVE X={x:.3f} Y={y:.3f} F={speed:.1f}",
+            f"$ID={self._next_command_id()} CMD=MOVE X={x:.3f} Y={y:.3f} F={speed:.1f}{acceleration_param}",
             timeout_s=timeout_s,
         )
 

@@ -92,7 +92,20 @@ float feedRateToMmPerSecond(float feedStepsPerSecond) {
   return clampFeedRate(feedStepsPerSecond) / STEPS_PER_MM;
 }
 
-float rampedFeedRate(uint16_t stepIndex, uint16_t totalSteps, float targetFeedStepsPerSecond) {
+float clampAcceleration(float accelerationStepsPerSecondSquared) {
+  return constrain(
+    accelerationStepsPerSecondSquared,
+    MIN_ACCELERATION_STEPS_PER_SECOND_SQUARED,
+    MAX_ACCELERATION_STEPS_PER_SECOND_SQUARED
+  );
+}
+
+float rampedFeedRate(
+  uint16_t stepIndex,
+  uint16_t totalSteps,
+  float targetFeedStepsPerSecond,
+  float accelerationStepsPerSecondSquared
+) {
   const float targetFeed = clampFeedRate(targetFeedStepsPerSecond);
   const float startFeed = min(targetFeed, RAMP_START_FEED_STEPS_PER_SECOND);
   if (totalSteps <= 1 || targetFeed <= startFeed) {
@@ -107,7 +120,7 @@ float rampedFeedRate(uint16_t stepIndex, uint16_t totalSteps, float targetFeedSt
   const float rampDistanceSteps = (float)min(stepsFromStart, stepsUntilStop);
   const float rampFeed = sqrtf(
     startFeed * startFeed
-    + 2.0f * ACCELERATION_STEPS_PER_SECOND_SQUARED * rampDistanceSteps
+    + 2.0f * clampAcceleration(accelerationStepsPerSecondSquared) * rampDistanceSteps
   );
   return min(targetFeed, rampFeed);
 }
@@ -126,12 +139,19 @@ void delayMicrosecondsSafe(unsigned long durationUs) {
   }
 }
 
-void pulseStep(uint8_t pulPin, uint8_t dirPin, uint16_t steps, bool directionPositive, float feedStepsPerSecond) {
+void pulseStep(
+  uint8_t pulPin,
+  uint8_t dirPin,
+  uint16_t steps,
+  bool directionPositive,
+  float feedStepsPerSecond,
+  float accelerationStepsPerSecondSquared
+) {
   digitalWrite(dirPin, directionPositive ? HIGH : LOW);
   delayMicroseconds(1000);
 
   for (uint16_t i = 0; i < steps; ++i) {
-    const float currentFeed = rampedFeedRate(i, steps, feedStepsPerSecond);
+    const float currentFeed = rampedFeedRate(i, steps, feedStepsPerSecond, accelerationStepsPerSecondSquared);
     const unsigned long pulseDelayUs = feedRateToPulseDelayUs(currentFeed);
     digitalWrite(pulPin, HIGH);
     delayMicrosecondsSafe(pulseDelayUs);
@@ -149,6 +169,7 @@ void processMoveCommand(const ParsedCommand& cmd, const char* line) {
   float xTarget = 0.0f;
   float yTarget = 0.0f;
   float feed = DEFAULT_FEED_STEPS_PER_SECOND;
+  float acceleration = DEFAULT_ACCELERATION_STEPS_PER_SECOND_SQUARED;
 
   while ((token = strtok(nullptr, " \t")) != nullptr) {
     if (strncmp(token, "X=", 2) == 0) {
@@ -157,22 +178,25 @@ void processMoveCommand(const ParsedCommand& cmd, const char* line) {
       yTarget = atof(token + 2);
     } else if (strncmp(token, "F=", 2) == 0) {
       feed = atof(token + 2);
+    } else if (strncmp(token, "A=", 2) == 0) {
+      acceleration = atof(token + 2);
     }
   }
 
   const float deltaX = xTarget - currentX;
   const float deltaY = yTarget - currentY;
   const float safeFeed = clampFeedRate(feed);
+  const float safeAcceleration = clampAcceleration(acceleration);
 
   if (deltaX != 0.0f) {
     const uint16_t stepCount = (uint16_t)abs((int)round(deltaX * STEPS_PER_MM));
-    pulseStep(X_PUL_PIN, X_DIR_PIN, stepCount, deltaX > 0.0f, safeFeed);
+    pulseStep(X_PUL_PIN, X_DIR_PIN, stepCount, deltaX > 0.0f, safeFeed, safeAcceleration);
     currentX = xTarget;
   }
 
   if (deltaY != 0.0f) {
     const uint16_t stepCount = (uint16_t)abs((int)round(deltaY * STEPS_PER_MM));
-    pulseStep(Y_PUL_PIN, Y_DIR_PIN, stepCount, deltaY > 0.0f, safeFeed);
+    pulseStep(Y_PUL_PIN, Y_DIR_PIN, stepCount, deltaY > 0.0f, safeFeed, safeAcceleration);
     currentY = yTarget;
   }
 

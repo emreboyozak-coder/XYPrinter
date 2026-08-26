@@ -70,7 +70,7 @@ $ID=<n> CMD=HOME
 ### MOVE
 
 ```text
-$ID=<n> CMD=MOVE X=<mm> Y=<mm> F=<mm/s>
+$ID=<n> CMD=MOVE X=<mm> Y=<mm> F=<steps/s> A=<steps/s^2>
 ```
 
 ### JOG
